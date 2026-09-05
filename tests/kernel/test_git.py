@@ -175,3 +175,21 @@ def test_a_plain_directory_is_not_a_repo(tmp_path: Path) -> None:
     root.mkdir()
 
     assert Repo(root).is_repo() is False
+
+
+def test_file_at_reads_a_path_as_it_stands_in_a_commit_and_is_none_where_it_is_absent(
+    git_repo: Path,
+) -> None:
+    repo = Repo(git_repo)
+    (git_repo / "README.md").write_text("# changed\n")
+
+    assert repo.file_at("HEAD", "README.md") == "# test\n"
+    assert repo.file_at("HEAD", "missing.md") is None
+
+
+@pytest.mark.parametrize(("ref", "path"), [("-x", "README.md"), ("HEAD", "--all")])
+def test_file_at_refuses_a_ref_or_a_path_that_starts_with_a_dash(
+    git_repo: Path, ref: str, path: str
+) -> None:
+    with pytest.raises(GitError):
+        Repo(git_repo).file_at(ref, path)

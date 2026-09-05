@@ -10,6 +10,7 @@ from pathlib import Path
 
 _READ_LIMIT = 20_000
 _KERNEL_IDENTITY = ("-c", "user.name=ra Kernel", "-c", "user.email=ra@localhost")
+_ABSENT_PATH_HINTS = ("does not exist", "exists on disk, but not in")
 
 
 class GitError(RuntimeError):
@@ -156,3 +157,18 @@ class Repo:
         for argument in (ref, *paths):
             _refuse_option(argument)
         return self._read("diff", ref, "--", *paths)
+
+    def file_at(self, ref: str, path: str) -> str | None:
+        """The whole content of `path` at `ref`, or `None` when it does not exist there.
+
+        Not cut at the read limit: the Gate compares eval files with it, so a truncated
+        text would read as a changed case. Any other git failure raises `GitError`.
+        """
+        for argument in (ref, path):
+            _refuse_option(argument)
+        try:
+            return self._run("show", f"{ref}:{path}").stdout
+        except GitError as error:
+            if any(hint in str(error) for hint in _ABSENT_PATH_HINTS):
+                return None
+            raise
