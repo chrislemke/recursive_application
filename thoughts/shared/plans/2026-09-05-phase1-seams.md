@@ -167,3 +167,31 @@ Logfire's configuration is process-global, so the tests share one `configure_tra
 
 - Closed 2026-09-05: `thoughts/**` and `.scratch/**` are protected (spec, round 1).
 - Kernel commits are unsigned by design. Signed Kernel commits would need a dedicated signing identity, not the user's 1Password key.
+
+## Amendments from implementation (2026-09-05, proposed for the user's confirmation)
+
+Recorded after tickets 02 to 06 were built and reviewed, so that every test under `tests/kernel/` sits at a listed seam. Each item is an Interface addition, a semantics change, or a tracer bullet added beyond the lists above, either by the implementing agent (for an Interface sentence or ticket criterion that had no bullet) or by the two-axis review.
+
+**paths**
+- Interface: `resolve_repo_root(env: Mapping[str, str] | None = None) -> Path`, the function behind `REPO_ROOT = resolve_repo_root()`, so the `RA_REPO_ROOT` override is testable with a plain dict and no module reload.
+- Semantics: relative paths are resolved against `root` too (symlinks and `..` included), so a link under the write scope that points at a Protected Path follows the rule of its target. Review finding: without this, `wiki/link -> docs` made `wiki/link/x.md` writable while its absolute spelling was protected.
+- Bullets: 4b. an absolute path through a symlink to the repo is resolved before the rule applies; 4c. a relative path through a symlink under `wiki/` into `docs/` is protected and not writable; 7b. `resolve_repo_root({"RA_REPO_ROOT": dir})` returns `dir` and `resolve_repo_root({})` finds the checkout; 9b. `../README.md` is never writable.
+
+**settings**
+- Semantics: `openrouter_api_key` and `logfire_token` are excluded from `repr` (the "never printed or logged" invariant); `load_settings` treats a blank variable already in the environment as absent and fills it from the file, the same reading `env_ignore_empty` gives `Settings` itself.
+- Bullets: 6. an unknown key in the file is ignored; 7. a key from the environment is stripped of surrounding whitespace; 8. a blank token is not exported; 9. a variable the user set with surrounding whitespace is left exactly as set; 10. a blank `OPENROUTER_API_KEY` in the environment is filled from the file; 11. neither the key nor the token appears in `repr(settings)`.
+
+**records**
+- Bullets: 7. a generated `run_id` matches `\d{8}-\d{6}-[0-9a-f]{6}`; 8. `Agent(TestModel(), name=..., output_type=TriageDecision).run_sync(...)` returns a `TriageDecision`.
+- `list_all()` orders by `(started_at, run_id)`, so equal start times are deterministic.
+
+**tracing**
+- Bullets: 4b. the error span's `status_description` is `"ValueError: boom"`; 5b. blank lines are skipped.
+- The module fixture also points `LOGFIRE_CREDENTIALS_DIR` at an empty temporary directory: with `if-token-present`, Logfire reads `.logfire/logfire_credentials.json` from the working directory (gitignored, so invisible to git), and a developer's `logfire projects use` at the repo root would have sent test spans to the cloud.
+
+**breaker**
+- Bullets: 2b. an open breaker reads `half_open` from `states()` once the timeout has elapsed; 3b. a re-opened breaker waits the full timeout again.
+
+**git**
+- Bullets: 2b. `diff_text(max_chars=100)` is cut at 100 characters and ends in a marker; 6b. a refused `show("--output=<file>")` leaves no file behind.
+- The bullet 3 signing test also sets `gpg.format=openpgp`: with this machine's global `gpg.format=ssh`, an unusable `gpg.program` is ignored and a regression would hang on the SSH signer instead of failing.
