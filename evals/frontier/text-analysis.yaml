@@ -1,0 +1,85 @@
+# Frontier: text-analysis. Human-written ladder; the system is expected to fail these today (ADR 0009).
+# Gap kind expected at Triage: skill. Expected closing move: a Specialist with its own prompt whose dataset is this file.
+# Text A: Epictetus, Enchiridion, section 1, George Long's translation (1877, public domain).
+# Text B: John Stuart Mill, On Liberty, chapter 1 (1859, public domain).
+cases:
+  - name: text-analysis-1-summarise
+    inputs: |
+      Summarise the argument of the following text in at most five sentences.
+
+      Of things some are in our power, and others are not. In our power are opinion, movement toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power are the body, property, reputation, offices, and in a word, whatever are not our own acts. And the things in our power are by nature free, not subject to restraint nor hindrance: but the things not in our power are weak, slavish, subject to restraint, in the power of others. Remember then that if you think the things which are by nature slavish to be free, and the things which are in the power of others to be your own, you will be hindered, you will lament, you will be disturbed, you will blame both gods and men: but if you think that only which is your own to be your own, and if you think that what is another's, as it really is, belongs to another, no man will ever compel you, no man will hinder you, you will never blame any man, you will accuse no man, you will do nothing involuntarily, no man will harm you, you will have no enemy, for you will not suffer any harm.
+    metadata: {tier: frontier, capability: text-analysis, rung: 1, gap_kind: skill}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The summary has at most five sentences. It states the central distinction between what is in our power
+            (our own acts: opinion, desire, aversion) and what is not (body, property, reputation, offices). It states
+            the practical conclusion: mistaking the second kind for the first leads to hindrance, lament, and blame,
+            while treating only one's own acts as one's own frees a person from compulsion and harm. It adds no claim
+            that is not in the text.
+          include_input: true
+
+  - name: text-analysis-2-premises-and-conclusion
+    inputs: |
+      Reconstruct the argument of the following text as numbered premises and a conclusion. Number each premise on its own line and mark the conclusion explicitly.
+
+      Of things some are in our power, and others are not. In our power are opinion, movement toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power are the body, property, reputation, offices, and in a word, whatever are not our own acts. And the things in our power are by nature free, not subject to restraint nor hindrance: but the things not in our power are weak, slavish, subject to restraint, in the power of others. Remember then that if you think the things which are by nature slavish to be free, and the things which are in the power of others to be your own, you will be hindered, you will lament, you will be disturbed, you will blame both gods and men: but if you think that only which is your own to be your own, and if you think that what is another's, as it really is, belongs to another, no man will ever compel you, no man will hinder you, you will never blame any man, you will accuse no man, you will do nothing involuntarily, no man will harm you, you will have no enemy, for you will not suffer any harm.
+    metadata: {tier: frontier, capability: text-analysis, rung: 2, gap_kind: skill}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer lists numbered premises and one explicitly marked conclusion. The premises include: (a) things
+            divide into those in our power and those not; (b) things in our power are free and unhindered, things not
+            in our power are subject to others; (c) treating the second kind as the first causes hindrance, lament,
+            disturbance, and blame. The conclusion is that treating only one's own acts as one's own leaves a person
+            uncompelled, unhindered, blaming no one, and unharmed. No premise is invented.
+          include_input: true
+
+  - name: text-analysis-3-validity-and-objection
+    inputs: |
+      Does the conclusion of the following argument follow from its premises? Answer with a judgement on validity, a reason grounded in the argument's structure, and one substantive objection that targets a specific premise.
+
+      Of things some are in our power, and others are not. In our power are opinion, movement toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power are the body, property, reputation, offices, and in a word, whatever are not our own acts. And the things in our power are by nature free, not subject to restraint nor hindrance: but the things not in our power are weak, slavish, subject to restraint, in the power of others. Remember then that if you think the things which are by nature slavish to be free, and the things which are in the power of others to be your own, you will be hindered, you will lament, you will be disturbed, you will blame both gods and men: but if you think that only which is your own to be your own, and if you think that what is another's, as it really is, belongs to another, no man will ever compel you, no man will hinder you, you will never blame any man, you will accuse no man, you will do nothing involuntarily, no man will harm you, you will have no enemy, for you will not suffer any harm.
+    metadata: {tier: frontier, capability: text-analysis, rung: 3, gap_kind: skill}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer gives an explicit verdict on whether the conclusion follows and explains it by reference to the
+            argument's structure (for example, that the conclusion depends on redefining harm as something that only
+            befalls what is in our power). It states at least one substantive objection, such as that the dichotomy is
+            not exhaustive, that bodily harm is harm regardless of judgement, or that opinion and desire are not fully
+            in our power, and the objection names the premise it targets.
+          include_input: true
+
+  - name: text-analysis-4-compare-two-texts
+    inputs: |
+      Compare the concept of freedom in Text A and Text B. State where the two views conflict and where they complement each other.
+
+      Text A: Of things some are in our power, and others are not. In our power are opinion, movement toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power are the body, property, reputation, offices, and in a word, whatever are not our own acts. And the things in our power are by nature free, not subject to restraint nor hindrance: but the things not in our power are weak, slavish, subject to restraint, in the power of others.
+
+      Text B: The only freedom which deserves the name, is that of pursuing our own good in our own way, so long as we do not attempt to deprive others of theirs, or impede their efforts to obtain it. Each is the proper guardian of his own health, whether bodily, or mental and spiritual. Mankind are greater gainers by suffering each other to live as seems good to themselves, than by compelling each to live as seems good to the rest.
+    metadata: {tier: frontier, capability: text-analysis, rung: 4, gap_kind: skill}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer identifies that Text A locates freedom inside the agent, in judgements and desires that no one
+            else can restrain, while Text B locates freedom in the absence of interference by others in pursuing one's
+            own good. It states at least one point of conflict (for example, Text A implies external constraint cannot
+            touch real freedom, which Text B treats as the very thing that destroys it) and at least one point where the
+            views complement each other. Neither view is misattributed.
+          include_input: true
+
+  - name: text-analysis-5-critique-and-reply
+    inputs: |
+      Write a critique of the following text: give at least two distinct counterarguments, the strongest reply the author could make to each, and a reasoned verdict.
+
+      Of things some are in our power, and others are not. In our power are opinion, movement toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power are the body, property, reputation, offices, and in a word, whatever are not our own acts. And the things in our power are by nature free, not subject to restraint nor hindrance: but the things not in our power are weak, slavish, subject to restraint, in the power of others. Remember then that if you think the things which are by nature slavish to be free, and the things which are in the power of others to be your own, you will be hindered, you will lament, you will be disturbed, you will blame both gods and men: but if you think that only which is your own to be your own, and if you think that what is another's, as it really is, belongs to another, no man will ever compel you, no man will hinder you, you will never blame any man, you will accuse no man, you will do nothing involuntarily, no man will harm you, you will have no enemy, for you will not suffer any harm.
+    metadata: {tier: frontier, capability: text-analysis, rung: 5, gap_kind: skill}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The critique presents at least two distinct counterarguments, each referring to a specific claim in the
+            text. For each, it gives the strongest reply the author could make, stated fairly. It closes with a verdict
+            that follows from the exchange rather than from assertion. The writing is organised so that each
+            counterargument and its reply are easy to find.
+          include_input: true

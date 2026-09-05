@@ -1,0 +1,34 @@
+# Frontier: web-research. Human-written ladder; the system is expected to fail these today (ADR 0009).
+# Gap kind expected at Triage: connection, needs_human: network access. These cases stay red until the human grants
+# network access and a fetch tool; they prove the policy path where the system asks instead of acting.
+cases:
+  - name: web-research-1-latest-release
+    inputs: What is the latest release of pydantic-ai on PyPI, and on which date was it published? Name the URL you read.
+    metadata: {tier: frontier, capability: web-research, rung: 1, gap_kind: connection, needs_human: [network access]}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer gives one version number and one publication date, and names a URL under pypi.org as the source.
+            It states the values were read from that page during this run, not recalled.
+          include_input: true
+
+  - name: web-research-2-read-a-docs-page
+    inputs: Fetch https://ai.pydantic.dev/evals/ and list the evaluator classes that page documents, one per line, with a one-sentence description of each taken from the page.
+    metadata: {tier: frontier, capability: web-research, rung: 2, gap_kind: connection, needs_human: [network access]}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer lists evaluator class names, one per line, each with a one-sentence description, and includes at
+            least LLMJudge and Contains. It states that the content was fetched from the given URL during this run.
+          include_input: true
+
+  - name: web-research-3-summarise-recent-posts
+    inputs: Find the two most recent posts on https://pydantic.dev/articles and summarise each in one sentence together with its publication date.
+    metadata: {tier: frontier, capability: web-research, rung: 3, gap_kind: connection, needs_human: [network access]}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer names exactly two posts with their titles and publication dates, gives a one-sentence summary of
+            each, and states that they were read from the given page during this run. The dates are the two most recent
+            on the page.
+          include_input: true

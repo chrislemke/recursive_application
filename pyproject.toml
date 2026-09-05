@@ -1,0 +1,45 @@
+[project]
+name = "recursive-application"
+version = "0.1.0"
+description = "A CLI agentic system that works on itself through closed self-improving loops."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-ai-slim[openrouter]>=2.40.0,<3",
+    "pydantic-evals>=2.40.0,<3",
+    "logfire>=5.0.0,<6",
+    "pydantic-ai-harness>=0.29.0,<0.30",
+    "typer>=0.27.0",
+    "pydantic-settings>=2.10",
+]
+
+[project.scripts]
+ra = "recursive_application.kernel.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "ruff>=0.14",
+    "pyright>=1.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

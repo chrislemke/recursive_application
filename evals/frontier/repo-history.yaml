@@ -1,0 +1,46 @@
+# Frontier: repo-history. Human-written ladder; the system is expected to fail these today (ADR 0009).
+# Gap kind expected at Triage: tool. Expected closing move: exposing the read-only git tools to an Act-phase agent.
+# Rung 1 is deterministic: the first commit of this repository is "initial commit" and never changes.
+cases:
+  - name: repo-history-1-first-commit
+    inputs: How many commits does this repository have, and what is the message of the very first one?
+    metadata: {tier: frontier, capability: repo-history, rung: 1, gap_kind: tool}
+    evaluators:
+      - Contains: initial commit
+      - LLMJudge:
+          rubric: >-
+            The answer gives a commit count as a number and quotes the first commit's message. It says the figures come
+            from the repository's git history, not from memory or guesswork.
+          include_input: true
+
+  - name: repo-history-2-files-in-first-commit
+    inputs: Which files did the first commit add under docs/adr/? List them by file name.
+    metadata: {tier: frontier, capability: repo-history, rung: 2, gap_kind: tool}
+    evaluators:
+      - Contains: 0001-kernel-organism-split.md
+      - LLMJudge:
+          rubric: >-
+            The answer lists six files named 0001 to 0006 under docs/adr/, each with its full file name, and lists no
+            file that the question did not ask about.
+          include_input: true
+
+  - name: repo-history-3-latest-commit
+    inputs: Who authored the most recent commit, when was it made, and what did its message say? Name where the information came from.
+    metadata: {tier: frontier, capability: repo-history, rung: 3, gap_kind: tool}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer names an author, gives a date, quotes a commit message, and states that these were read from the
+            git log. It does not hedge with "probably" or offer alternatives; it reports one commit.
+          include_input: true
+
+  - name: repo-history-4-evolution-of-a-path
+    inputs: Summarise how docs/adr/ has evolved. List every commit that touched that directory in chronological order, one line per commit, with the change it made to the directory.
+    metadata: {tier: frontier, capability: repo-history, rung: 4, gap_kind: tool}
+    evaluators:
+      - LLMJudge:
+          rubric: >-
+            The answer is a chronological list with one line per commit that touched docs/adr/. Each line names the
+            commit (short hash or message) and the files it added, changed, or removed under that directory. The first
+            line is the initial commit. The answer states it was derived from the git history.
+          include_input: true

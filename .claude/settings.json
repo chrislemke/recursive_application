@@ -1,0 +1,7 @@
+{
+  "enabledPlugins": {
+    "security-guidance@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "pydantic-ai@claude-plugins-official": true
+  }
+}
