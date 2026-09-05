@@ -33,7 +33,19 @@ REPO_ROOT: Path = resolve_repo_root()
 RA_DIRNAME = ".ra"
 """The gitignored runtime directory under the repo root."""
 
-RA_SUBDIRS: tuple[str, ...] = ("traces", "runs", "tasks", "evals")
+TRACES_DIRNAME = "traces"
+"""Runtime subdirectory: one JSONL Trace Store file per run."""
+
+RUNS_DIRNAME = "runs"
+"""Runtime subdirectory: one Run Record per run."""
+
+TASKS_DIRNAME = "tasks"
+"""Runtime subdirectory: per-run Target Cases and task output."""
+
+EVALS_DIRNAME = "evals"
+"""Runtime subdirectory: persisted eval reports and the latest pointer."""
+
+RA_SUBDIRS: tuple[str, ...] = (TRACES_DIRNAME, RUNS_DIRNAME, TASKS_DIRNAME, EVALS_DIRNAME)
 """What `ensure_ra_dirs` creates inside the runtime directory."""
 
 PROTECTED_DIRS: tuple[str, ...] = (
