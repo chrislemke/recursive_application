@@ -1,0 +1,122 @@
+# Implementer: the Act-phase agent that makes the Plan's failing tests pass under
+# src/recursive_application/organism/ and nothing more. Task function (ticket 15): the tests are
+# written into a scratch checkout, the Implementer runs there under a tool-call cap, and the output
+# is {pytest_exit, ruff_format, ruff_check, ty, green, checks_clean} as YAML.
+# Expensive: run through `ra evals --all`.
+cases:
+  - name: implementer-1-wiki-lists-its-lesson-pages
+    inputs: |
+      plan:
+        title: The Wiki can list its lesson pages
+        evidence: >-
+          The Librarian writes lessons to wiki/pages/lessons/, but the Wiki module offers no way to
+          read them back, so the Learn phase cannot tell whether a lesson for this run already
+          exists.
+        cause: >-
+          organism/wiki.py exposes pages(), list_open_questions(), and list_capabilities(), but
+          nothing for the lessons category.
+        change: >-
+          Add Wiki.list_lessons(), returning the POSIX paths of the pages under pages/lessons/,
+          sorted, and nothing else.
+        target_paths:
+          - src/recursive_application/organism/wiki.py
+        tests:
+          - >-
+            `Wiki.list_lessons()` on a Wiki holding pages/lessons/red-before-green.md and
+            pages/capabilities/text-analysis.md returns exactly
+            ["pages/lessons/red-before-green.md"].
+        target_cases:
+          - name: wiki-lists-lessons
+            inputs: Which lessons has the Wiki recorded?
+            rubric: >-
+              The answer lists the lesson pages by their paths under pages/lessons/ and lists no page
+              from another category.
+        predicted_impact: >-
+          The Learn phase can read the recorded lessons; the index, the log, and the lint report are
+          unchanged.
+        at_risk:
+          - librarian
+        actor: implementer
+      tests:
+        - path: tests/organism/test_wiki_lessons.py
+          content: |
+            """The Wiki's lesson pages, through `Wiki.list_lessons()`."""
+
+            from pathlib import Path
+
+            from recursive_application.organism.wiki import Wiki
+
+
+            def test_list_lessons_names_only_the_pages_under_the_lessons_category(
+                tmp_path: Path,
+            ) -> None:
+                wiki = Wiki(tmp_path)
+                wiki.ensure_layout()
+                lessons = tmp_path / "pages" / "lessons"
+                capabilities = tmp_path / "pages" / "capabilities"
+                (lessons / "red-before-green.md").write_text("# Red before green\n")
+                (capabilities / "text-analysis.md").write_text("# Text analysis\n")
+
+                assert wiki.list_lessons() == ["pages/lessons/red-before-green.md"]
+    evaluators:
+      - Contains: "pytest_exit: 0"
+      - Contains: "green: true"
+      - Contains: "checks_clean: true"
+
+  - name: implementer-2-wiki-reads-back-its-log-entries
+    inputs: |
+      plan:
+        title: The Wiki can read back its log entries
+        evidence: >-
+          append_log() writes one timestamped line per entry, but nothing reads the log back, so a
+          Sensor cannot tell what the Librarian recorded in earlier runs.
+        cause: >-
+          organism/wiki.py has index_text() for the index and nothing for the log.
+        change: >-
+          Add Wiki.log_entries(), returning the log's entries in file order without the "# Wiki log"
+          heading and without the leading "- " of each line.
+        target_paths:
+          - src/recursive_application/organism/wiki.py
+        tests:
+          - >-
+            `Wiki.log_entries()` on a Wiki whose clock reads 2026-09-05T12:00:00Z and which logged
+            "Improvement accepted" then "Iteration rejected: no red" returns
+            ["2026-09-05T12:00:00Z: Improvement accepted",
+            "2026-09-05T12:00:00Z: Iteration rejected: no red"].
+        target_cases:
+          - name: wiki-reads-its-log
+            inputs: What did the Wiki log during the last run?
+            rubric: >-
+              The answer quotes the log entries in the order they were written, with their
+              timestamps, and invents no entry.
+        predicted_impact: >-
+          The log becomes readable evidence; append_log stays append-only and the log file is not
+          rewritten.
+        at_risk:
+          - librarian
+        actor: implementer
+      tests:
+        - path: tests/organism/test_wiki_log_entries.py
+          content: |
+            """The Wiki log's entries, through `Wiki.log_entries()`."""
+
+            from datetime import UTC, datetime
+            from pathlib import Path
+
+            from recursive_application.organism.wiki import Wiki
+
+
+            def test_log_entries_returns_the_logged_lines_without_the_heading(tmp_path: Path) -> None:
+                wiki = Wiki(tmp_path, clock=lambda: datetime(2026, 9, 5, 12, 0, tzinfo=UTC))
+                wiki.ensure_layout()
+                wiki.append_log("Improvement accepted")
+                wiki.append_log("Iteration rejected: no red")
+
+                assert wiki.log_entries() == [
+                    "2026-09-05T12:00:00Z: Improvement accepted",
+                    "2026-09-05T12:00:00Z: Iteration rejected: no red",
+                ]
+    evaluators:
+      - Contains: "pytest_exit: 0"
+      - Contains: "green: true"
+      - Contains: "checks_clean: true"

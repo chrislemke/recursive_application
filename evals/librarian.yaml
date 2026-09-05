@@ -1,0 +1,52 @@
+# Librarian: the Learn-phase agent that maintains the Wiki, the system's memory, and writes nowhere
+# else. Task function (ticket 15): `inputs` is a YAML mapping holding the run summary; the Librarian
+# is given a scratch Wiki and the output is {summary, log_tail, pages} rendered as YAML.
+cases:
+  - name: librarian-1-accepted-improvement-writes-a-capability-page
+    inputs: |
+      run_summary: |
+        Run 20260905-101500-a1b2c3, Growth Loop, outcome accepted, one Iteration, commit 4f2a91c.
+        Plan: give the Worker the read-only git tools so it can answer questions about the
+        repository's history. Changed: src/recursive_application/organism/tools.py and
+        src/recursive_application/organism/prompts/worker.md. Target Cases: the four rungs of
+        evals/frontier/repo-history.yaml, all green after the change; the Guard Cases in
+        evals/triage.yaml and evals/answers.yaml did not regress. The Gate passed all ten checks and
+        the Reviewer accepted the diff. Lesson from the Iteration: the first attempt shelled out to
+        `git log` through the shell tool and was denied by the Policy Ceiling; the git tools are a
+        separate toolset and had to be named in the tool configuration.
+    evaluators:
+      - Contains: pages/capabilities/
+      - LLMJudge:
+          rubric: >-
+            A capability page for repo-history was written under pages/capabilities/. It carries the
+            capability's name, one paragraph saying what the system can now do, a line beginning
+            "- Commit: " with the commit 4f2a91c, and a line beginning "- Dataset: " with
+            evals/frontier/repo-history.yaml, which is the capability page convention. The log entry
+            is one line naming the run 20260905-101500-a1b2c3 and the accepted Improvement. Every
+            fact in the page and the entry comes from the run summary: no other commit, dataset,
+            capability, or outcome is invented, and nothing outside the Wiki is claimed to have been
+            written.
+          include_input: true
+
+  - name: librarian-2-rejected-iteration-writes-a-lesson
+    inputs: |
+      run_summary: |
+        Run 20260905-142200-d4e5f6, Growth Loop, outcome rejected, two Iterations, no commit.
+        Plan: add Wiki.list_lessons() so the Learn phase can read back the lessons it wrote. The
+        Test Writer's tests were red for the right reason and the Implementer made them green, but
+        the Gate failed on the review check: the Reviewer rejected the diff because the test
+        recomputed its expected value from wiki.pages() with the same prefix filter the
+        implementation uses, so it passed by construction. The tree was reset; nothing was
+        committed. The second Iteration hit the Iteration limit before a new test was written.
+    evaluators:
+      - Contains: pages/lessons/
+      - LLMJudge:
+          rubric: >-
+            A lesson page was written under pages/lessons/ recording what this run taught: a test
+            whose expected value is recomputed the way the implementation computes it is
+            tautological, is rejected by the Reviewer, and must instead assert an independent
+            literal. The page states the situation it applies to so a later run can act on it. The
+            log entry is one line naming the run 20260905-142200-d4e5f6 and the rejected outcome.
+            No capability page is written, because nothing was committed and no dataset turned
+            green, and no fact outside the run summary is invented.
+          include_input: true

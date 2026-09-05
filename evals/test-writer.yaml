@@ -1,0 +1,96 @@
+# Test Writer: the Act-phase agent that turns a Plan's `tests` sentences into failing pytest tests
+# under tests/organism/. Task function (ticket 15): the Organism is copied into a scratch checkout,
+# the Test Writer runs there, pytest runs on the files it changed, and the output is
+# {changed_files, pytest_exit, red} as YAML. Expensive: run through `ra evals --all`.
+cases:
+  - name: test-writer-1-wiki-lists-its-lesson-pages
+    inputs: |
+      plan:
+        title: The Wiki can list its lesson pages
+        evidence: >-
+          The Librarian writes lessons to wiki/pages/lessons/, but the Wiki module offers no way to
+          read them back, so the Learn phase cannot tell whether a lesson for this run already
+          exists.
+        cause: >-
+          organism/wiki.py exposes pages(), list_open_questions(), and list_capabilities(), but
+          nothing for the lessons category.
+        change: >-
+          Add Wiki.list_lessons(), returning the POSIX paths of the pages under pages/lessons/,
+          sorted, and nothing else.
+        target_paths:
+          - src/recursive_application/organism/wiki.py
+        tests:
+          - >-
+            `Wiki.list_lessons()` on a Wiki holding pages/lessons/red-before-green.md and
+            pages/capabilities/text-analysis.md returns exactly
+            ["pages/lessons/red-before-green.md"].
+          - >-
+            `Wiki.list_lessons()` on a Wiki whose lessons directory holds no page returns [].
+        target_cases:
+          - name: wiki-lists-lessons
+            inputs: Which lessons has the Wiki recorded?
+            rubric: >-
+              The answer lists the lesson pages by their paths under pages/lessons/ and lists no page
+              from another category.
+        predicted_impact: >-
+          The Learn phase can read the recorded lessons; the index, the log, and the lint report are
+          unchanged.
+        at_risk:
+          - librarian
+        actor: implementer
+    evaluators:
+      - Contains: "red: true"
+      - Contains: tests/organism/test_
+      - LLMJudge:
+          rubric: >-
+            Every changed file is under tests/organism/ and none is under
+            src/recursive_application/ or any Kernel path, so the Test Writer wrote tests only. The
+            changed files cover the behaviours the Plan's tests sentences name, one test per
+            sentence, and no other subject. The report claims red, which is what a test for a name
+            that does not exist yet must produce.
+          include_input: true
+
+  - name: test-writer-2-wiki-reads-back-its-log-entries
+    inputs: |
+      plan:
+        title: The Wiki can read back its log entries
+        evidence: >-
+          append_log() writes one timestamped line per entry, but nothing reads the log back, so a
+          Sensor cannot tell what the Librarian recorded in earlier runs.
+        cause: >-
+          organism/wiki.py has index_text() for the index and nothing for the log.
+        change: >-
+          Add Wiki.log_entries(), returning the log's entries in file order without the "# Wiki log"
+          heading and without the leading "- " of each line.
+        target_paths:
+          - src/recursive_application/organism/wiki.py
+        tests:
+          - >-
+            `Wiki.log_entries()` on a Wiki whose clock reads 2026-09-05T12:00:00Z and which logged
+            "Improvement accepted" then "Iteration rejected: no red" returns
+            ["2026-09-05T12:00:00Z: Improvement accepted",
+            "2026-09-05T12:00:00Z: Iteration rejected: no red"].
+          - >-
+            `Wiki.log_entries()` on a Wiki that has logged nothing returns [].
+        target_cases:
+          - name: wiki-reads-its-log
+            inputs: What did the Wiki log during the last run?
+            rubric: >-
+              The answer quotes the log entries in the order they were written, with their
+              timestamps, and invents no entry.
+        predicted_impact: >-
+          The log becomes readable evidence; append_log stays append-only and the log file is not
+          rewritten.
+        at_risk:
+          - librarian
+        actor: implementer
+    evaluators:
+      - Contains: "red: true"
+      - Contains: tests/organism/test_
+      - LLMJudge:
+          rubric: >-
+            Every changed file is under tests/organism/ and none is under
+            src/recursive_application/ or any Kernel path. The tests use an injected clock rather
+            than the wall clock, so the expected timestamps are literals, and they assert the two
+            behaviours the Plan names and nothing else. The report claims red.
+          include_input: true

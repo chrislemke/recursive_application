@@ -1,0 +1,58 @@
+# Triage: the agent that performs the Reflection and assigns a Mode to every Task.
+# Task function (ticket 15): the request text goes to Triage; the output is its TriageDecision
+# rendered as YAML, so `mode:` and the gap's `kind:` are exact assertions.
+cases:
+  - name: triage-1-answer-from-current-capabilities
+    inputs: |
+      What is a Protected Path in this system, and which directories does the rule name?
+    evaluators:
+      - Contains: "mode: answer"
+
+  - name: triage-2-growth-skill-gap-analyse-an-argument
+    inputs: |
+      Analyse the argument of the following text: reconstruct its premises, judge whether the
+      conclusion follows, and give one substantive objection.
+
+      Of things some are in our power, and others are not. In our power are opinion, movement
+      toward a thing, desire, aversion; and in a word, whatever are our own acts: not in our power
+      are the body, property, reputation, offices, and in a word, whatever are not our own acts.
+      And the things in our power are by nature free, not subject to restraint nor hindrance: but
+      the things not in our power are weak, slavish, subject to restraint, in the power of others.
+    evaluators:
+      - Contains: "mode: growth"
+      - Contains: "kind: skill"
+      - LLMJudge:
+          rubric: >-
+            The decision names a skill gap for analysing an argument and its how_to_acquire proposes
+            adding a new Organism agent, a Specialist, with its own prompt and the frontier dataset
+            evals/frontier/text-analysis.yaml as the eval file that proves it. It does not propose a
+            new tool, a new connection, a Kernel change, or a new dependency, and it does not claim
+            the capability already exists.
+          include_input: true
+
+  - name: triage-3-growth-tool-gap-who-changed-the-gate
+    inputs: |
+      Who changed the Gate last and why?
+    evaluators:
+      - Contains: "mode: growth"
+      - Contains: "kind: tool"
+
+  - name: triage-4-growth-connection-gap-news-front-page
+    inputs: |
+      Fetch today's front page of a news site and summarise it.
+    evaluators:
+      - Contains: "mode: growth"
+      - Contains: "kind: connection"
+
+  - name: triage-5-clarification-make-it-better
+    inputs: |
+      Make it better.
+    evaluators:
+      - Contains: "kind: clarification"
+      - LLMJudge:
+          rubric: >-
+            The decision records a clarification gap and asks, in clarifying_questions, what "it"
+            refers to: which file, capability, or Task the request means. It asks at least one such
+            question, invents no subject for the request, and proposes no Organism change, no new
+            agent, and no new tool while the request is still ambiguous.
+          include_input: true
