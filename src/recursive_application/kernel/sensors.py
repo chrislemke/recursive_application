@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
-from typing import Any, Protocol
+from typing import Any
 
 from recursive_application.kernel.evals import (
     EvalReport,
@@ -24,6 +24,7 @@ from recursive_application.kernel.evals import (
 from recursive_application.kernel.paths import EVALS_DIRNAME, RUNS_DIRNAME, TRACES_DIRNAME
 from recursive_application.kernel.records import Contract, RunRecord, RunStore, SensorFinding
 from recursive_application.kernel.tracing import read_spans
+from recursive_application.kernel.wiki_protocol import OpenQuestionLike, WikiReader
 
 FEEDBACK_FILENAME = "feedback.jsonl"
 """The JSON lines file under the runtime directory holding the human's feedback."""
@@ -305,33 +306,6 @@ class FindingStore:
 def stored_findings(store: FindingStore) -> list[SensorFinding]:
     """The findings the Kernel recorded during runs, as they were written."""
     return [finding for finding, _ in store.list_all()]
-
-
-class OpenQuestionLike(Protocol):
-    """What the Wiki Sensor needs from an open question: its page, its title, its capability."""
-
-    @property
-    def path(self) -> str: ...
-
-    @property
-    def title(self) -> str: ...
-
-    @property
-    def capability(self) -> str | None: ...
-
-
-class WikiReader(Protocol):
-    """The seam between the Watcher and the Wiki it reads.
-
-    The Wiki module lives in the Organism (ADR 0003); the Kernel names only what it needs
-    from it, so an Improvement to the Wiki can never stop the Watcher importing (ADR 0010).
-    The Organism's `Wiki` satisfies this structurally.
-    """
-
-    @property
-    def root(self) -> Path: ...
-
-    def list_open_questions(self) -> Sequence[OpenQuestionLike]: ...
 
 
 def wiki_findings(questions: Sequence[OpenQuestionLike]) -> list[SensorFinding]:
