@@ -19,8 +19,8 @@ ra = "recursive_application.kernel.cli:app"
 [dependency-groups]
 dev = [
     "pytest>=9.1",
-    "ruff>=0.14",
-    "pyright>=1.1",
+    "ruff>=0.16",
+    "ty>=0.0.78,<0.1",
 ]
 
 [build-system]
@@ -30,16 +30,22 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# ruff >= 0.16 formats Python code blocks inside Markdown by default. The reference copies
+# under docs/ are verbatim and must stay so, hence Markdown is excluded from ruff entirely.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "SIM", "PTH", "N", "RUF"]
 
-[tool.pyright]
-pythonVersion = "3.12"
-venvPath = "."
-venv = ".venv"
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
 include = ["src", "tests"]
-typeCheckingMode = "standard"
+
+[tool.ty.terminal]
+# Errors fail the check; warnings are reported but do not fail it.
+error-on-warning = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
