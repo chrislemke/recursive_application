@@ -53,3 +53,24 @@ class WikiReader(Protocol):
     def list_open_questions(self) -> Sequence[OpenQuestionLike]: ...
 
     def list_capabilities(self) -> Sequence[CapabilityPageLike]: ...
+
+
+class LintReportLike(Protocol):
+    """A Wiki lint report: pages nothing links to, and pages the index does not link to."""
+
+    @property
+    def orphans(self) -> Sequence[str]: ...
+
+    @property
+    def unindexed(self) -> Sequence[str]: ...
+
+
+class WikiMaintainer(WikiReader, Protocol):
+    """What the Kernel does to the Wiki after the Librarian wrote: rebuild the index, append
+    the log, and lint. The Organism's `Wiki` satisfies this structurally."""
+
+    def rebuild_index(self) -> str: ...
+
+    def append_log(self, entry: str) -> None: ...
+
+    def lint_report(self) -> LintReportLike: ...
