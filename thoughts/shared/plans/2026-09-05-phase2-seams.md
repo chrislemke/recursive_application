@@ -498,3 +498,9 @@ Recorded as each ticket lands, so that every test sits at a listed seam. Each it
 
 **wiki protocol (extended for 18 and 23)**
 - `kernel/wiki_protocol.py` gains `LintReportLike` (`orphans`, `unindexed`) and `WikiMaintainer(WikiReader)` with `rebuild_index()`, `append_log(entry)`, `lint_report()`.
+
+**From the two-axis review of tickets 13 and 14 (2026-09-05)**
+- bundle: `render_inventory(registry, report, ratios, capabilities, tools, cases)` takes the case names of every dataset (`dataset_cases(registry, root) -> dict[str, list[str]]`, new in the Interface) and proves a dataset only when every case in the file has a passing result; a `### Tools` section lists every distinct tool once with its description; a Specialist is listed only once proven; tools are typed through a `ToolDescriptionLike` Protocol and `describe_tools` is imported inside `assemble_state_bundle`; `frontier_line`, `run_line`, `finding_line`, `EVALS_ROOT_DIRNAME` are public.
+- registry: `validate_registry` refuses an entry whose dataset is not under `evals/` (`EVALS_DIRNAME_TRACKED`), before the existence checks; bullet 3 gains that case.
+- runtime: the Kernel's instructions go in through `agent.override(instructions=...)`, replacing an agent's own; `UsageLimits` carries `total_tokens_limit = budget * 1_000_000 / FALLBACK_USD_PER_MILLION_TOKENS` (`Decimal("3")`, in `runtime.py`; the Loop's `estimated_cost` uses the same constant); a usage-limit stop is returned through the breaker, not raised, so it never counts as a model failure. Bullets: 2b a rogue agent instruction never reaches the model; 4b the token limit stops a run at a budget of 0.003 USD; 5b three limit stops leave the breaker closed.
+- status: `lint_wiki` takes a `WikiMaintainer`; `MAX_RUNS = 5`, `MAX_REPORTS = 5`; the frontier, run, and finding lines are the bundle's.
