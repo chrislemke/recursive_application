@@ -34,6 +34,9 @@ Tier = Literal["primary", "judge"]
 CODING_GUIDE = "docs/coding-guide.md"
 """The guide the coding roles read, repo-relative."""
 
+EVALS_DIRNAME_TRACKED = "evals"
+"""Where every entry's dataset must live: the tracked eval directory."""
+
 REGISTRY_MODULE = "src/recursive_application/organism/agents.py"
 """The Organism module holding the registry; a change there affects every agent."""
 
@@ -178,6 +181,15 @@ def _refuse_model(entries: Sequence[RegistryEntry]) -> None:
             )
 
 
+def _refuse_dataset_outside_evals(entries: Sequence[RegistryEntry]) -> None:
+    for entry in entries:
+        if not entry.dataset.startswith(f"{EVALS_DIRNAME_TRACKED}/"):
+            raise RegistryError(
+                f"entry {entry.name!r}: dataset is not under {EVALS_DIRNAME_TRACKED}/: "
+                f"{entry.dataset!r}"
+            )
+
+
 def _refuse_missing_files(entries: Sequence[RegistryEntry], root: Path) -> None:
     for entry in entries:
         for guide in entry.guides:
@@ -227,6 +239,7 @@ def validate_registry(entries: Sequence[RegistryEntry], root: Path = REPO_ROOT) 
     _refuse_role_mismatch(entries)
     _refuse_specialist_outside_act(entries)
     _refuse_model(entries)
+    _refuse_dataset_outside_evals(entries)
     _refuse_missing_files(entries, root)
     _refuse_unnamed_phase(entries, root)
     _refuse_tools_above_the_ceiling(entries)

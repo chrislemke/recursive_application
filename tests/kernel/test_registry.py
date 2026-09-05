@@ -158,6 +158,11 @@ def _with_specialist(entries: Sequence[RegistryEntry]) -> tuple[RegistryEntry, .
             lambda entries: _changed(entries, "worker", tools=ToolConfig(shell_commands=["git"])),
             "git",
         ),
+        # A dataset that does not live under evals/.
+        (
+            lambda entries: _changed(entries, "worker", dataset="tests/organism/spec.yaml"),
+            "evals/",
+        ),
         # A tool configuration outside an agent's write scope.
         (
             lambda entries: _changed(
@@ -184,6 +189,7 @@ def _with_specialist(entries: Sequence[RegistryEntry]) -> tuple[RegistryEntry, .
         "missing-prompt",
         "missing-dataset",
         "tools-above-the-ceiling",
+        "dataset-outside-evals",
         "tools-outside-the-write-scope",
         "specialist-outside-act",
         "agent-with-a-model",
