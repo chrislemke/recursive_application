@@ -23,7 +23,14 @@ from recursive_application.kernel.cli import KernelContext, app
 from recursive_application.kernel.evals import CaseResult, DatasetError, EvalReport
 from recursive_application.kernel.git import Repo
 from recursive_application.kernel.loop import LoopOptions, LoopResult, Runners
-from recursive_application.kernel.records import Mode, Outcome, RunRecord
+from recursive_application.kernel.records import (
+    EvalCase,
+    IterationRecord,
+    Mode,
+    Outcome,
+    Plan,
+    RunRecord,
+)
 from recursive_application.kernel.registry import load_registry
 from recursive_application.kernel.runtime import AgentRunner
 from recursive_application.kernel.sensors import FEEDBACK_FILENAME, FeedbackStore
@@ -247,6 +254,69 @@ def test_an_unattended_run_is_never_asked_for_feedback(
     assert result.exit_code == 0
     assert FEEDBACK_QUESTION not in result.output
     assert not (tmp_path / ".ra" / FEEDBACK_FILENAME).exists()
+
+
+GROWTH_PLAN = Plan(
+    title="Teach the Worker what the Gate is",
+    evidence="The answers dataset holds no case about the Gate.",
+    cause="Nothing in the Organism states what the Gate is.",
+    change="Add a glossary module and the answers case that proves it.",
+    target_cases=[
+        EvalCase(
+            name="answers-4-what-is-the-gate", inputs="What is the Gate?", must_contain=["Gate"]
+        )
+    ],
+    predicted_impact="The new answers case passes and no Guard Case regresses.",
+)
+
+
+def _growth_result(
+    outcome: Outcome, *, reason: str | None = None, exit_code: int = 0
+) -> LoopResult:
+    """What the Loop runner hands back from an improve run: two Iterations and no Answer."""
+    record = RunRecord(
+        mode=Mode.GROWTH,
+        task=None,
+        outcome=outcome,
+        iterations=[
+            IterationRecord(number=1, plan=GROWTH_PLAN, outcome="accepted"),
+            IterationRecord(number=2, outcome="rejected", reason="no red: 1 passed"),
+        ],
+    )
+    return LoopResult(record=record, reason=reason, exit_code=exit_code)
+
+
+def test_improve_hands_its_goal_to_the_growth_loop_and_prints_one_line_per_iteration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[_LoopCall] = []
+    monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
+    monkeypatch.setattr(cli, "LoopRunner", _fake_loop(calls, _growth_result("accepted")))
+
+    result = runner.invoke(app, ["improve", "--goal", "reduce cost", "--yes"])
+
+    assert result.exit_code == 0
+    assert calls == [_LoopCall(Mode.GROWTH, None, LoopOptions(yes=True, goal="reduce cost"))]
+    assert "Iteration 1: accepted Teach the Worker what the Gate is\n" in result.output
+    assert "Iteration 2: rejected no red: 1 passed\n" in result.output
+    assert "Outcome: accepted" in result.output
+
+
+def test_improve_exits_with_the_code_the_run_ended_on_and_prints_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
+    monkeypatch.setattr(
+        cli,
+        "LoopRunner",
+        _fake_loop([], _growth_result("aborted", reason="iteration limit", exit_code=2)),
+    )
+
+    result = runner.invoke(app, ["improve"])
+
+    assert result.exit_code == 2
+    assert "Outcome: aborted" in result.output
+    assert "Reason: iteration limit" in result.output
 
 
 @dataclass

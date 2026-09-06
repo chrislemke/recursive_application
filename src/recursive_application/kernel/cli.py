@@ -218,11 +218,6 @@ def _run_command(action: Callable[[], int]) -> None:
     raise typer.Exit(code=code)
 
 
-def _not_implemented(command: str) -> None:
-    typer.echo(f"ra {command}: not implemented yet", err=True)
-    raise typer.Exit(code=EXIT_ABORTED)
-
-
 def _new_run_id() -> str:
     """A run id for a command that is not a Loop run but still names one in what it writes."""
     return RunRecord(mode=Mode.TASK).run_id
@@ -261,6 +256,29 @@ def _ask_for_feedback(ctx: KernelContext, result: LoopResult, *, yes: bool) -> N
     )
 
 
+def _loop_runner(ctx: KernelContext) -> LoopRunner:
+    """The Loop over the context's collaborators, the same for `ask` and `improve`."""
+    return LoopRunner(
+        settings=ctx.settings,
+        registry=ctx.registry,
+        agents=ctx.agents,
+        repo=ctx.repo,
+        wiki=ctx.wiki,
+        root=ctx.root,
+        ra_dir=ctx.ra_dir,
+        runners=ctx.runners,
+        breakers=ctx.breakers,
+    )
+
+
+def _print_iterations(record: RunRecord) -> None:
+    """One line per Iteration: its number, how it ended, and the Plan's title or the reason."""
+    for iteration in record.iterations:
+        about = iteration.plan.title if iteration.plan else iteration.reason
+        line = f"Iteration {iteration.number}: {iteration.outcome}"
+        typer.echo(line if about is None else f"{line} {about}")
+
+
 def _print_result(result: LoopResult) -> None:
     """What the Operator sees of a run: the questions or the output, then how it ended."""
     if result.questions:
@@ -284,18 +302,7 @@ def ask(
 
     def action() -> int:
         ctx = build_context()
-        loop = LoopRunner(
-            settings=ctx.settings,
-            registry=ctx.registry,
-            agents=ctx.agents,
-            repo=ctx.repo,
-            wiki=ctx.wiki,
-            root=ctx.root,
-            ra_dir=ctx.ra_dir,
-            runners=ctx.runners,
-            breakers=ctx.breakers,
-        )
-        result = loop.run(
+        result = _loop_runner(ctx).run(
             None,
             text,
             LoopOptions(yes=yes, max_iterations=max_iterations, budget_usd=_budget_usd(budget)),
@@ -315,7 +322,24 @@ def improve(
     budget: BudgetOption = None,
 ) -> None:
     """Run the Growth Loop."""
-    _not_implemented("improve")
+
+    def action() -> int:
+        ctx = build_context()
+        result = _loop_runner(ctx).run(
+            Mode.GROWTH,
+            None,
+            LoopOptions(
+                yes=yes,
+                max_iterations=max_iterations,
+                budget_usd=_budget_usd(budget),
+                goal=goal,
+            ),
+        )
+        _print_iterations(result.record)
+        _print_result(result)
+        return result.exit_code
+
+    _run_command(action)
 
 
 @app.command()
