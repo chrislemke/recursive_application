@@ -8,7 +8,8 @@ Trace Store through the injected `Runners`, and every Iteration is appended to t
 as it ends, so a crash leaves the record behind.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -21,15 +22,26 @@ from pydantic import Field
 from recursive_application.kernel.breaker import BreakerStore, CircuitOpenError
 from recursive_application.kernel.bundle import LoopPosition, assemble_state_bundle, frontier_dir
 from recursive_application.kernel.checks import RedResult
-from recursive_application.kernel.evals import EvalReport, ReportStore, case_for, compare
+from recursive_application.kernel.evals import (
+    EvalDelta,
+    EvalReport,
+    ReportStore,
+    case_for,
+    changed_eval_cases,
+    compare,
+    dataset_name,
+    list_datasets,
+)
 from recursive_application.kernel.gate import GateInputs, evaluate
 from recursive_application.kernel.git import Repo
 from recursive_application.kernel.paths import EVALS_DIRNAME, RUNS_DIRNAME, TASKS_DIRNAME
 from recursive_application.kernel.records import (
     CapabilityGap,
     CheckResult,
+    CodeReport,
     Contract,
     EvalCase,
+    GateResult,
     IterationRecord,
     Mode,
     Outcome,
@@ -42,7 +54,12 @@ from recursive_application.kernel.records import (
     Usage,
     WorkerOutput,
 )
-from recursive_application.kernel.registry import Phase, Registry
+from recursive_application.kernel.registry import (
+    EVALS_DIRNAME_TRACKED,
+    Phase,
+    Registry,
+    affected_agents,
+)
 from recursive_application.kernel.runtime import (
     FALLBACK_USD_PER_MILLION_TOKENS,
     AgentRunError,
@@ -93,7 +110,6 @@ UNKNOWN_ACTOR = "unknown actor"
 
 NO_TARGET_CASES = "no Target Cases"
 """The reason an Iteration is refused before Act when its Plan proves nothing (ADR 0010)."""
-"""Why the Kernel refuses an Iteration before Act: the Plan named an Actor it may not invoke."""
 
 RETRY_HEADING = "Previous attempt failed because:"
 """What a retrying Worker is told about the Iteration the judge turned down."""
@@ -103,6 +119,40 @@ BEST_EFFORT_FINDING_SUFFIX = "best-effort"
 
 BEST_EFFORT_RULES: tuple[str, ...] = ("iteration limit", "no progress")
 """The stop rules that return the last output as best effort instead of aborting the run."""
+
+DIRTY_TREE = "dirty working tree"
+"""Why a Growth Loop refuses to start: a reset would destroy work the human has not committed."""
+
+LOCK_HELD = "lock held"
+"""Why a Growth Loop refuses to start: another run of this checkout is already changing it."""
+
+GROWTH_ACTOR = "implementer"
+"""The registry entry that fills the Act slot of a Growth Iteration when the Plan names none."""
+
+PYTHON_SUFFIX = ".py"
+"""What makes a target path code: only then do the Test Writer and the red check run (ADR 0008)."""
+
+NO_RED = "no red"
+"""The reason an Iteration is rejected: the tests the Test Writer wrote passed straight away."""
+
+NO_DATASET = "no dataset"
+"""The reason a frontier Plan is refused when no dataset under `evals/` holds its first case."""
+
+DATASET_OUTSIDE_EVALS = "dataset outside evals/"
+"""The reason a Plan is refused when the dataset it names is not a tracked eval file."""
+"""The stop reason when a Plan appends nothing and no dataset under `evals/` holds its targets."""
+
+COMMIT_MESSAGE_PREFIX = "ra: "
+"""How every commit the Kernel writes begins, so an Improvement is one grep in the history."""
+
+GUARD_DATASETS: tuple[str, ...] = ("triage", "answers")
+"""The datasets every Growth Iteration guards, whatever else it changed."""
+
+ORGANISM_TESTS_PREFIX = "tests/organism/"
+"""Where the Test Writer may write, and so where the red check looks for the files it runs."""
+
+_FIRST_COMMAND_CHECK = "ruff-format"
+"""The first Gate check the Kernel has to run a subprocess for: the four checks' stage."""
 
 
 class LoopOptions(Contract):
@@ -155,11 +205,35 @@ class LoopResult:
 
 @dataclass(frozen=True)
 class _TargetCases:
-    """The Definition of Done as the Kernel wrote it: the runtime dataset and its case keys."""
+    """The Definition of Done as the Kernel wrote it: the dataset and its case keys.
 
-    cases_path: Path
+    `cases_path` is the runtime `cases.yaml` of an Answer or Task run and `None` for a Growth
+    Iteration, whose Target Cases live in the tracked dataset the Plan names.
+    """
+
+    cases_path: Path | None
     dataset: str
     targets: list[str]
+    dataset_path: str = ""
+
+
+@dataclass(frozen=True)
+class _GrowthAct:
+    """What one Growth Iteration's Act produced: the Test Writer's report and the Actor's."""
+
+    test_report: CodeReport | None
+    code_report: CodeReport
+
+
+@dataclass(frozen=True)
+class _Verdict:
+    """The Gate's judgement of one Iteration and the evidence it was reached on."""
+
+    gate: GateResult
+    report: EvalReport | None = None
+    delta: EvalDelta | None = None
+    review: Review | None = None
+    diff_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -205,12 +279,43 @@ def _worker_prompt(task: str, judge_reason: str | None) -> str:
     return f"{task}\n\n{RETRY_HEADING} {judge_reason}"
 
 
-def _judge_reason(report: EvalReport, targets: Sequence[str]) -> str | None:
+def _dataset_of(path: str) -> str:
+    """The dataset name of a repo-relative eval file: `evals/answers.yaml` is `answers`."""
+    return dataset_name(Path(path), evals_dir=Path(EVALS_DIRNAME_TRACKED))
+
+
+def _unique(names: Iterable[str]) -> list[str]:
+    """The names in the order they were first named, without repeats."""
+    return list(dict.fromkeys(names))
+
+
+def _run_summary(
+    plan: Plan, diff_paths: Sequence[str], gate: GateResult, *, run_id: str, sha: str, dataset: str
+) -> str:
+    """What the Librarian records: the Improvement, its breadcrumbs, its diff, and the verdict.
+
+    The commit and the dataset are the two lines a capability page needs to be evidence (the
+    Librarian's page convention), so the Kernel commits first and hands them over.
+    """
+    paths = "\n".join(f"- {path}" for path in diff_paths) or "(none)"
+    checks = ", ".join(f"{check.name}: {check.status}" for check in gate.checks)
+    return (
+        f"Improvement: {plan.title}\n\n{plan.change}\n\n"
+        f"Run: {run_id}\nCommit: {sha}\nDataset: {dataset}\n\n"
+        f"Changed paths:\n{paths}\n\nGate: {checks}"
+    )
+
+
+def _judge_reason(report: EvalReport | None, targets: Sequence[str]) -> str | None:
     """Why the judge turned the Answer down, or `None` when it passed."""
     result = case_for(report, targets[0])
     if result is None or result.passed:
         return None
     return "; ".join(result.reasons) or "the judge gave no reason"
+
+
+class _Escalated(Exception):
+    """A Task Loop found a Capability Gap and, with the human's approval, becomes Growth."""
 
 
 class _StopError(Exception):
@@ -235,6 +340,23 @@ def _gap_details(gap: CapabilityGap) -> str:
             f"needs_human: {', '.join(gap.needs_human)}",
         ]
     )
+
+
+def _indented_cases(specs: Sequence[dict[str, Any]]) -> str:
+    """`specs` as the lines that follow `cases:` in a dataset file, in the seed files' style.
+
+    PyYAML puts a nested sequence at its parent's indentation; the seed files indent it one
+    level deeper, so every line under a key gains two more spaces than the dump gives it.
+    """
+    lines = []
+    for spec in specs:
+        dumped = yaml.safe_dump([spec], sort_keys=False, default_flow_style=False)
+        for line in dumped.splitlines():
+            stripped = line.lstrip(" ")
+            depth = (len(line) - len(stripped)) // 2
+            extra = 2 if stripped.startswith("- ") and depth > 0 else 0
+            lines.append(f"  {' ' * (depth * 2 + extra)}{stripped}")
+    return "".join(f"{line}\n" for line in lines)
 
 
 def _plan_yaml(plan: Plan) -> str:
@@ -335,7 +457,7 @@ class LoopRunner:
                 return self._answer(state)
             if record.mode is Mode.TASK:
                 return self._task(state)
-            self._unsupported(record.mode)
+            return self._growth(state)
         except _StopError as stop:
             if stop.reason == "clarification":
                 self._finish(state.record, "aborted")
@@ -406,18 +528,186 @@ class LoopRunner:
             number += 1
         return self._stopped(state, rule)
 
-    def _unsupported(self, mode: Mode) -> NoReturn:
-        """A Mode this runner does not drive yet ends the run as an internal error."""
-        raise NotImplementedError(f"the Loop runner does not run Mode {mode} yet")
+    def _growth(self, state: _RunState, first: int = 1) -> LoopResult:
+        """Growth Loop: the Organism changes itself, on a clean tree and under the lock."""
+        if not self._repo.is_clean():
+            raise _StopError(DIRTY_TREE)
+        with self._lock(state.record.run_id):
+            number = first
+            while (rule := self._stop_rule(state, number)) is None:
+                if self._iteration(state, number, self._growth_act_of(state)):
+                    self._finish(state.record, "accepted")
+                    return LoopResult(record=state.record, output=state.output, exit_code=0)
+                number += 1
+            return self._stopped(state, rule)
+
+    @contextmanager
+    def _lock(self, run_id: str) -> Iterator[None]:
+        """Hold the Growth lock: one Growth Loop per checkout, released however the run ends."""
+        path = self._ra_dir / LOCK_FILENAME
+        if path.exists():
+            raise _StopError(LOCK_HELD)
+        path.write_text(run_id, encoding="utf-8")
+        try:
+            yield
+        finally:
+            path.unlink(missing_ok=True)
+
+    def _growth_act_of(self, state: _RunState) -> Callable[[int, datetime], bool]:
+        """The Growth Iteration's Act as `_iteration` drives it, bound to this run's state."""
+        return lambda number, started_at: self._growth_act(state, number, started_at)
+
+    def _growth_act(self, state: _RunState, number: int, started_at: datetime) -> bool:
+        """Decide, Act, and Gate of one Growth Iteration: the Plan, the coders, the judgement."""
+        plan = self._plan(state, number)
+        state.plan = plan
+        actor = plan.actor or GROWTH_ACTOR
+        refusal = self._refusal_before_act(plan, actor, GROWTH_ACTOR) or self._dataset_refusal(plan)
+        if refusal is not None:
+            self._reject_before_act(state, number, started_at, plan, refusal)
+            return False
+        self._record_growth_gaps(state, plan.gaps)
+        cases = self._growth_cases(plan)
+        self._append_target_cases(plan)
+        try:
+            self._approve(state, _plan_yaml(plan))
+        except _StopError:
+            # The Kernel's own append must not survive a refusal: the tree goes back to HEAD.
+            self._repo.reset_hard_clean()
+            raise
+        test_report: CodeReport | None = None
+        if any(path.endswith(PYTHON_SUFFIX) for path in plan.target_paths):
+            test_report = self._write_tests(state, number, plan)
+            red = self._runners.red_check(self._root, self._changed_tests())
+            if not red.red:
+                reason = f"{NO_RED}: {red.output}"
+                self._reject_before_act(state, number, started_at, plan, reason, test_report)
+                return False
+        code_report = self._act(state, number, plan, actor)
+        return self._gate_iteration(
+            state,
+            number,
+            started_at,
+            cases,
+            plan,
+            growth=_GrowthAct(test_report=test_report, code_report=code_report),
+        )
+
+    def _write_tests(self, state: _RunState, number: int, plan: Plan) -> CodeReport:
+        """Act: the Test Writer turns the Plan's `tests` into tests that fail (ADR 0008)."""
+        result = self._call(
+            state,
+            "test_writer",
+            _actor_prompt(state.record.task or "", plan, None),
+            iteration=number,
+            phase="act",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        report: CodeReport = result.output
+        return report
+
+    def _act(self, state: _RunState, number: int, plan: Plan, actor: str) -> CodeReport:
+        """Act: the Implementer, or the Specialist the Plan names, makes those tests pass."""
+        result = self._call(
+            state,
+            actor,
+            _actor_prompt(state.record.task or "", plan, state.judge_reason),
+            iteration=number,
+            phase="act",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        report: CodeReport = result.output
+        return report
+
+    def _changed_tests(self) -> list[str]:
+        """The Organism test files this Iteration changed: what the red check runs."""
+        return [
+            path for path in self._repo.changed_paths() if path.startswith(ORGANISM_TESTS_PREFIX)
+        ]
+
+    def _dataset_refusal(self, plan: Plan) -> str | None:
+        """Why the Plan's dataset cannot be used: outside `evals/`, or no file holds its cases."""
+        if plan.dataset is not None:
+            if (
+                not plan.dataset.startswith(f"{EVALS_DIRNAME_TRACKED}/")
+                or not (self._root / plan.dataset).is_file()
+            ):
+                return f"{DATASET_OUTSIDE_EVALS}: {plan.dataset}"
+            return None
+        try:
+            self._dataset_holding(plan.target_cases[0].name)
+        except _StopError as stop:
+            return stop.reason
+        return None
+
+    def _record_growth_gaps(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> None:
+        """A Growth Planner's gaps: escalation is where the run already is, so what the human
+        must grant is recorded and a clarification ends the run, as everywhere else."""
+        questions = [gap.description for gap in gaps if gap.kind == "clarification"]
+        if questions:
+            state.questions = questions
+            raise _StopError("clarification")
+        for gap in gaps:
+            if gap.needs_human:
+                self._record_gap(state, gap)
+
+    def _growth_cases(self, plan: Plan) -> _TargetCases:
+        """The Definition of Done: the dataset the Target Cases live in and their keys under it."""
+        dataset = (
+            _dataset_of(plan.dataset)
+            if plan.dataset is not None
+            else self._dataset_holding(plan.target_cases[0].name)
+        )
+        return _TargetCases(
+            cases_path=None,
+            dataset=dataset,
+            targets=[f"{dataset}/{case.name}" for case in plan.target_cases],
+            dataset_path=plan.dataset or f"{EVALS_DIRNAME_TRACKED}/{dataset}.yaml",
+        )
+
+    def _dataset_holding(self, case_name: str) -> str:
+        """The dataset an existing Target Case lives in, for a Plan that appends nothing."""
+        evals_dir = self._root / EVALS_DIRNAME_TRACKED
+        for path in list_datasets(evals_dir):
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if any(case.get("name") == case_name for case in document.get("cases", [])):
+                return dataset_name(path, evals_dir=evals_dir)
+        raise _StopError(f"{NO_DATASET}: {case_name}")
+
+    def _append_target_cases(self, plan: Plan) -> None:
+        """Add the Plan's new Target Cases to the dataset it names; datasets are append-only.
+
+        A Target Case whose name is already in the file is one the Plan means to turn green,
+        and a Plan with no dataset targets Frontier Cases that exist: neither is written.
+        """
+        if plan.dataset is None:
+            return
+        path = self._root / plan.dataset
+        text = path.read_text(encoding="utf-8")
+        known = {case.get("name") for case in yaml.safe_load(text).get("cases", [])}
+        appended = [_case_spec(case) for case in plan.target_cases if case.name not in known]
+        if not appended:
+            return
+        # Appended as text after the last line, so every existing byte of the file, its comment
+        # header and block scalars included, stays exactly as the human wrote it.
+        indented = _indented_cases(appended)
+        if not text.endswith("\n"):
+            text += "\n"
+        path.write_text(text + indented, encoding="utf-8")
 
     def _task(self, state: _RunState) -> LoopResult:
-        """Task Loop: the Planner states the Definition of Done and the Actor works against it."""
+        """Task Loop: the Planner states the Definition of Done and the Actor works against it;
+        a Capability Gap the human approves turns the rest of the run into a Growth Loop."""
         number = 1
-        while (rule := self._stop_rule(state, number)) is None:
-            if self._iteration(state, number, self._task_act_of(state)):
-                self._finish(state.record, "accepted")
-                return LoopResult(record=state.record, output=state.output, exit_code=0)
-            number += 1
+        try:
+            while (rule := self._stop_rule(state, number)) is None:
+                if self._iteration(state, number, self._task_act_of(state)):
+                    self._finish(state.record, "accepted")
+                    return LoopResult(record=state.record, output=state.output, exit_code=0)
+                number += 1
+        except _Escalated:
+            state.judge_reason = None
+            return self._growth(state, first=len(state.record.iterations) + 1)
         return self._stopped(state, rule)
 
     def _iteration(
@@ -431,6 +721,9 @@ class LoopRunner:
             return act(number, started_at)
         except _StopError as stop:
             self._append_unfinished(state, number, started_at, "aborted", stop.reason)
+            raise
+        except _Escalated:
+            self._append_unfinished(state, number, started_at, "rejected", "escalated to growth")
             raise
         except Exception as error:
             self._append_unfinished(state, number, started_at, "error", str(error))
@@ -452,7 +745,7 @@ class LoopRunner:
         state.plan = plan
         self._handle_gaps(state, plan.gaps)
         actor = plan.actor or TASK_ACTOR
-        refusal = self._refusal_before_act(plan, actor)
+        refusal = self._refusal_before_act(plan, actor, TASK_ACTOR)
         if refusal is not None:
             self._reject_before_act(state, number, started_at, plan, refusal)
             return False
@@ -470,13 +763,13 @@ class LoopRunner:
         state.output = output.content
         state.output_path = self._write_output(state.record.run_id, output.content)
         self._handle_gaps(state, output.gaps)
-        return self._gate_iteration(state, number, started_at, cases, output.content, plan)
+        return self._gate_iteration(state, number, started_at, cases, plan, content=output.content)
 
-    def _refusal_before_act(self, plan: Plan, actor: str) -> str | None:
+    def _refusal_before_act(self, plan: Plan, actor: str, default_actor: str) -> str | None:
         """Why the Kernel refuses this Plan before anything acts on it, or `None`."""
         if not plan.target_cases:
             return NO_TARGET_CASES
-        if not self._eligible(actor):
+        if not self._eligible(actor, default_actor):
             return f"{UNKNOWN_ACTOR}: {actor}"
         return None
 
@@ -486,14 +779,63 @@ class LoopRunner:
         number: int,
         started_at: datetime,
         cases: _TargetCases,
-        content: str,
         plan: Plan | None,
+        *,
+        content: str | None = None,
+        growth: _GrowthAct | None = None,
     ) -> bool:
-        """Gate of one Iteration: the Target Cases, the traces, and, in a Task Loop, the Reviewer.
+        """Gate of one Iteration, and Learn when the Gate passes.
 
         The Iteration is recorded before the Gate so the cost anomaly rule sees its spend, then
-        updated with the verdict; the Reviewer, the one check that costs a model call, runs only
-        once the cheaper evidence has passed, and what it costs lands in the same Iteration.
+        updated with the verdict; every gatherer runs its evidence in `CHECK_ORDER`'s order and
+        stops at the first failure, so a model call is the last thing an Iteration spends.
+        """
+        iteration = IterationRecord(
+            number=number,
+            started_at=started_at,
+            finished_at=self._runners.clock(),
+            plan=plan,
+            test_report=growth.test_report if growth is not None else None,
+            code_report=growth.code_report if growth is not None else None,
+            output_path=self._repo_relative(state.output_path) if state.output_path else None,
+            outcome="rejected",
+            usage=state.pending_usage,
+        )
+        self._runs.append_iteration(state.record, iteration)
+        verdict = (
+            self._growth_gate(state, number, cases, plan)
+            if growth is not None and plan is not None
+            else self._output_gate(state, number, cases, content or "", plan)
+        )
+        commit_sha: str | None = None
+        if verdict.gate.passed and growth is not None and plan is not None:
+            commit_sha = self._learn(state, number, plan, verdict, cases)
+        state.record.iterations[-1] = iteration.model_copy(
+            update={
+                "gate": verdict.gate,
+                "review": verdict.review,
+                "commit_sha": commit_sha,
+                "outcome": "accepted" if verdict.gate.passed else "rejected",
+                "finished_at": self._runners.clock(),
+                "usage": state.pending_usage,
+            }
+        )
+        self._runs.save(state.record)
+        state.pending_usage = Usage()
+        passing = verdict.delta.newly_passing if verdict.delta is not None else []
+        progress = [case for case in passing if case in cases.targets]
+        state.no_progress = 0 if progress else state.no_progress + 1
+        state.judge_reason = _judge_reason(verdict.report, cases.targets)
+        state.previous_gate = "passed" if verdict.gate.passed else "failed"
+        return verdict.gate.passed
+
+    def _output_gate(
+        self, state: _RunState, number: int, cases: _TargetCases, content: str, plan: Plan | None
+    ) -> _Verdict:
+        """Gate of an Answer or Task Iteration: the judge on the output, then the Reviewer.
+
+        The Reviewer is the one check that costs a model call, so it runs only once the Target
+        Cases and the trace anomalies have passed, and what it costs lands in this Iteration.
         """
         report = self._runners.evals(
             EvalRequest(
@@ -505,16 +847,6 @@ class LoopRunner:
             )
         )
         delta = compare(self._latest_report(), report, cases.targets)
-        iteration = IterationRecord(
-            number=number,
-            started_at=started_at,
-            finished_at=self._runners.clock(),
-            plan=plan,
-            output_path=self._repo_relative(state.output_path) if state.output_path else None,
-            outcome="rejected",
-            usage=state.pending_usage,
-        )
-        self._runs.append_iteration(state.record, iteration)
         inputs = GateInputs(
             mode=state.record.mode, eval_delta=delta, anomalies=self._anomalies(state)
         )
@@ -523,22 +855,119 @@ class LoopRunner:
         if plan is not None and gate.failed_checks == ["review"]:
             review = self._review(state, number, plan, content)
             gate = evaluate(inputs.model_copy(update={"review": review}))
-        state.record.iterations[-1] = iteration.model_copy(
-            update={
-                "gate": gate,
-                "review": review,
-                "outcome": "accepted" if gate.passed else "rejected",
-                "finished_at": self._runners.clock(),
-                "usage": state.pending_usage,
-            }
+        return _Verdict(gate=gate, report=report, delta=delta, review=review)
+
+    def _growth_gate(
+        self, state: _RunState, number: int, cases: _TargetCases, plan: Plan
+    ) -> _Verdict:
+        """Gate of a Growth Iteration: the diff, the four checks, the Guard subset, the Reviewer.
+
+        Each stage is gathered only when everything cheaper has passed, so a Protected Path in
+        the diff costs no subprocess, and a failing check costs no eval run and no model call.
+        """
+        diff_paths = self._repo.changed_paths()
+        inputs = GateInputs(
+            mode=Mode.GROWTH,
+            diff_paths=diff_paths,
+            changed_eval_cases=self._changed_eval_cases(diff_paths),
         )
-        self._runs.save(state.record)
-        state.pending_usage = Usage()
-        progress = [case for case in delta.newly_passing if case in cases.targets]
-        state.no_progress = 0 if progress else state.no_progress + 1
-        state.judge_reason = _judge_reason(report, cases.targets)
-        state.previous_gate = "passed" if gate.passed else "failed"
-        return gate.passed
+        if evaluate(inputs).failed_checks == [_FIRST_COMMAND_CHECK]:
+            inputs = inputs.model_copy(update={"checks": self._runners.checks(self._root)})
+        report: EvalReport | None = None
+        delta: EvalDelta | None = None
+        if evaluate(inputs).failed_checks == ["evals"]:
+            report, delta, retried = self._growth_evals(state, cases, diff_paths)
+            inputs = inputs.model_copy(
+                update={
+                    "eval_delta": delta,
+                    "guard_retry_passed": retried,
+                    "anomalies": self._anomalies(state),
+                }
+            )
+        review: Review | None = None
+        if evaluate(inputs).failed_checks == ["review"]:
+            review = self._review(state, number, plan, self._repo.diff_text())
+            inputs = inputs.model_copy(update={"review": review})
+        return _Verdict(
+            gate=evaluate(inputs),
+            report=report,
+            delta=delta,
+            review=review,
+            diff_paths=diff_paths,
+        )
+
+    def _changed_eval_cases(self, diff_paths: Sequence[str]) -> list[str]:
+        """The eval cases this Iteration changed or deleted; appending is the only edit allowed."""
+        prefix = f"{EVALS_DIRNAME_TRACKED}/"
+        changed: list[str] = []
+        for path in diff_paths:
+            if not path.startswith(prefix):
+                continue
+            working = self._root / path
+            after = working.read_text(encoding="utf-8") if working.exists() else None
+            changed.extend(changed_eval_cases(self._repo.file_at("HEAD", path), after))
+        return changed
+
+    def _growth_evals(
+        self, state: _RunState, cases: _TargetCases, diff_paths: Sequence[str]
+    ) -> tuple[EvalReport, EvalDelta, list[str]]:
+        """The Guard subset of one Iteration, with one retry for each Guard Case that regressed."""
+        run_id = state.record.run_id
+        datasets = _unique([cases.dataset, *GUARD_DATASETS, *self._affected_datasets(diff_paths)])
+        report = self._runners.evals(
+            EvalRequest(run_id=run_id, datasets=datasets, targets=cases.targets)
+        )
+        delta = compare(self._latest_report(), report, cases.targets)
+        if not delta.guard_regressions:
+            return report, delta, []
+        retry = self._runners.evals(
+            EvalRequest(
+                run_id=run_id,
+                datasets=_unique(key.rpartition("/")[0] for key in delta.guard_regressions),
+                targets=list(delta.guard_regressions),
+            )
+        )
+        retried = [
+            key
+            for key in delta.guard_regressions
+            if (result := case_for(retry, key)) is not None and result.passed
+        ]
+        return report, delta, retried
+
+    def _affected_datasets(self, diff_paths: Sequence[str]) -> list[str]:
+        """The datasets of the agents this diff touches: the rest of the Guard subset."""
+        return [
+            _dataset_of(self._registry.get(name).dataset)
+            for name in affected_agents(self._registry, diff_paths)
+        ]
+
+    def _learn(
+        self, state: _RunState, number: int, plan: Plan, verdict: _Verdict, cases: _TargetCases
+    ) -> str:
+        """Learn: the Kernel commits the gated diff, then the Librarian records it with the
+        commit and the dataset as its breadcrumbs, and the Wiki's own changes are committed
+        after it, so nothing unchecked rides into the Improvement's commit."""
+        sha = self._repo.commit_all(f"{COMMIT_MESSAGE_PREFIX}{plan.title}")
+        result = self._call(
+            state,
+            "librarian",
+            _run_summary(
+                plan,
+                verdict.diff_paths,
+                verdict.gate,
+                run_id=state.record.run_id,
+                sha=sha,
+                dataset=cases.dataset_path,
+            ),
+            iteration=number,
+            phase="learn",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        self._wiki.rebuild_index()
+        self._wiki.append_log(f"Run {state.record.run_id}: accepted {plan.title}")
+        if not self._repo.is_clean():
+            self._repo.commit_all(f"{COMMIT_MESSAGE_PREFIX}record {plan.title}")
+        return sha
 
     def _plan(self, state: _RunState, number: int) -> Plan:
         """Decide: the Planner turns the Task and the findings into a Definition of Done."""
@@ -584,12 +1013,20 @@ class LoopRunner:
             targets=[f"{dataset}/{case.name}" for case in plan.target_cases],
         )
 
-    def _eligible(self, actor: str) -> bool:
-        """Whether `actor` may fill the Act slot of a Task Iteration: the Worker or a Specialist."""
-        return actor == TASK_ACTOR or actor in {entry.name for entry in self._registry.specialists}
+    def _eligible(self, actor: str, default_actor: str) -> bool:
+        """Whether `actor` may fill this Mode's Act slot: the Mode's own agent, or a Specialist."""
+        return actor == default_actor or actor in {
+            entry.name for entry in self._registry.specialists
+        }
 
     def _reject_before_act(
-        self, state: _RunState, number: int, started_at: datetime, plan: Plan, reason: str
+        self,
+        state: _RunState,
+        number: int,
+        started_at: datetime,
+        plan: Plan,
+        reason: str,
+        test_report: CodeReport | None = None,
     ) -> None:
         """An Iteration the Kernel refuses before Act: no Gate, no progress, the Planner told.
 
@@ -603,6 +1040,7 @@ class LoopRunner:
                 started_at=started_at,
                 finished_at=self._runners.clock(),
                 plan=plan,
+                test_report=test_report,
                 outcome="rejected",
                 reason=reason,
                 usage=state.pending_usage,
@@ -660,7 +1098,7 @@ class LoopRunner:
                 sort_keys=False,
             ),
         )
-        self._unsupported(Mode.GROWTH)
+        raise _Escalated()
 
     def _stop_rule(self, state: _RunState, number: int) -> str | None:
         """The rule that ends the run before Iteration `number`, or `None` to go on."""
@@ -748,7 +1186,7 @@ class LoopRunner:
         output: WorkerOutput = result.output
         state.output = output.content
         state.output_path = self._write_output(state.record.run_id, output.content)
-        return self._gate_iteration(state, number, started_at, cases, output.content, None)
+        return self._gate_iteration(state, number, started_at, cases, None, content=output.content)
 
     def _call(
         self,

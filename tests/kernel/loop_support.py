@@ -9,7 +9,7 @@ frontier ratios, and the Wiki all read real files.
 """
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,10 +36,15 @@ class ScriptedModels:
     """A `model_factory` whose models answer each role from its script, one output per call."""
 
     def __init__(
-        self, script: Mapping[str, Sequence[Any]], *, usage: RequestUsage | None = None
+        self,
+        script: Mapping[str, Sequence[Any]],
+        *,
+        usage: RequestUsage | None = None,
+        on_call: Mapping[str, Callable[[], None]] | None = None,
     ) -> None:
         self._remaining = {role: list(outputs) for role, outputs in script.items()}
         self._usage = usage
+        self._on_call = dict(on_call or {})
         self.requests: dict[str, list[ScriptedRequest]] = {}
 
     def __call__(self, model_name: str) -> Model:
@@ -64,19 +69,26 @@ class ScriptedModels:
         outputs = self._remaining.get(role, [])
         if not outputs:
             raise AssertionError(f"the script has no further output for the role {role!r}")
+        effect = self._on_call.get(role)
+        if effect is not None:
+            effect()
         return _response(outputs.pop(0), info, self._usage)
 
 
 def scripted_models(
-    script: Mapping[str, Sequence[Any]], *, usage: RequestUsage | None = None
+    script: Mapping[str, Sequence[Any]],
+    *,
+    usage: RequestUsage | None = None,
+    on_call: Mapping[str, Callable[[], None]] | None = None,
 ) -> ScriptedModels:
     """A `model_factory` for `AgentRunner` that hands each role the outputs `script` lists.
 
     A contract comes back as the run's output tool call, a string as text, and an exception is
     raised where the model would have answered. Every scripted response reports `usage`, so a
-    test can give the run a price the budget stop rule reads.
+    test can give the run a price the budget stop rule reads. `on_call` runs a role's side
+    effect where the real agent's tools would have run, so a scripted coder changes real files.
     """
-    return ScriptedModels(script, usage=usage)
+    return ScriptedModels(script, usage=usage, on_call=on_call)
 
 
 def _role_of(instructions: str) -> str:
