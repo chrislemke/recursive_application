@@ -74,6 +74,8 @@ class Plan(Contract):
 
     `tests` holds one-sentence behaviours at a public interface; whether it may be
     empty depends on `target_paths` and is enforced by the Loop runner, not here.
+    `dataset` names the file under `evals/` the new Target Cases are appended to, and
+    is `None` when the targets are Frontier Cases that already exist.
     """
 
     title: str
@@ -87,6 +89,7 @@ class Plan(Contract):
     at_risk: list[str] = []
     gaps: list[CapabilityGap] = []
     actor: str | None = None
+    dataset: str | None = None
 
 
 class CheckResult(Contract):

@@ -204,3 +204,13 @@ def test_a_generated_run_id_is_a_utc_timestamp_and_six_hex_characters() -> None:
 
 def test_list_all_of_a_missing_directory_is_empty(tmp_path: Path) -> None:
     assert RunStore(tmp_path / "missing").list_all() == []
+
+
+def test_plan_records_the_dataset_its_new_target_cases_are_appended_to() -> None:
+    plan = _plan(dataset="evals/answers.yaml")
+
+    restored = Plan.model_validate_json(plan.model_dump_json())
+
+    assert restored == plan
+    assert restored.dataset == "evals/answers.yaml"
+    assert _plan().dataset is None

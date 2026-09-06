@@ -393,3 +393,23 @@ def test_a_usage_limit_stop_is_not_a_model_failure_and_leaves_the_breaker_closed
             runner.run(worker, "hello", bundle=BUNDLE_HEADING)
 
     assert breakers.states()["worker"] == BreakerState.CLOSED
+
+
+def test_a_budget_passed_for_one_call_replaces_the_settings_budget(tmp_path: Path) -> None:
+    worker = load_registry().get("worker")
+
+    def costly(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        response = _responder({"content": "fine", "gaps": []})(messages, info)
+        return replace(response, usage=RequestUsage(input_tokens=700, output_tokens=700))
+
+    runner = AgentRunner(
+        _settings(budget_usd=Decimal("5")),
+        BreakerStore(tmp_path / "breakers.json"),
+        root=REPO_ROOT,
+        model_factory=lambda name: FunctionModel(costly),
+    )
+
+    with pytest.raises(AgentRunError) as stopped:
+        runner.run(worker, "hello", bundle=BUNDLE_HEADING, budget_usd=Decimal("0.003"))
+
+    assert "1000" in str(stopped.value)

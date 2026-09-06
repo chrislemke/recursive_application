@@ -256,7 +256,7 @@ def render_bundle(
     return "\n\n".join(blocks) + "\n"
 
 
-def _frontier_dir(root: Path) -> Path:
+def frontier_dir(root: Path) -> Path:
     """Where the frontier ladders live under `root`, so a scratch checkout works the same way."""
     return root / EVALS_ROOT_DIRNAME / FRONTIER_DIRNAME
 
@@ -279,7 +279,7 @@ def assemble_state_bundle(
     # Imported here so the Kernel package never depends on the Organism at import time.
     from recursive_application.organism.tools import describe_tools
 
-    frontier = _frontier_dir(root)
+    frontier = frontier_dir(root)
     report = ReportStore(ra_dir / EVALS_DIRNAME).load_latest()
     inventory = render_inventory(
         registry,

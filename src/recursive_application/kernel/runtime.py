@@ -85,20 +85,33 @@ class AgentRunner:
         self._root = root
         self._model_factory = model_factory
 
-    def run(self, entry: RegistryEntry, prompt: str, *, bundle: str) -> AgentRunResult:
-        """Run `entry` on `prompt` with the State Bundle `bundle` and return its output."""
+    def run(
+        self,
+        entry: RegistryEntry,
+        prompt: str,
+        *,
+        bundle: str,
+        budget_usd: Decimal | None = None,
+    ) -> AgentRunResult:
+        """Run `entry` on `prompt` with the State Bundle `bundle` and return its output.
+
+        `budget_usd` is what this one call may spend, the run's remaining budget when the Loop
+        calls; `None` means the Settings budget.
+        """
         if entry.agent.model is not None:
             raise RegistryError(
                 f"entry {entry.name!r}: the agent sets a model ({entry.agent.model!r}); "
                 "the Kernel injects the model from the entry's tier"
             )
-        outcome = self._breakers.call(entry.name, lambda: self._run_once(entry, prompt, bundle))
+        outcome = self._breakers.call(
+            entry.name, lambda: self._run_once(entry, prompt, bundle, budget_usd)
+        )
         if isinstance(outcome, AgentRunError):
             raise outcome
         return outcome
 
     def _run_once(
-        self, entry: RegistryEntry, prompt: str, bundle: str
+        self, entry: RegistryEntry, prompt: str, bundle: str, budget_usd: Decimal | None
     ) -> AgentRunResult | AgentRunError:
         """One run of `entry`, inside its span; a usage limit is returned as `AgentRunError`.
 
@@ -118,7 +131,7 @@ class AgentRunner:
                     result = entry.agent.run_sync(
                         prompt,
                         model=model,
-                        usage_limits=self._usage_limits(entry),
+                        usage_limits=self._usage_limits(entry, budget_usd),
                         usage=run_usage,
                     )
             except UsageLimitExceeded as error:
@@ -132,7 +145,7 @@ class AgentRunner:
             )
             return AgentRunResult(output=result.output, usage=usage)
 
-    def _usage_limits(self, entry: RegistryEntry) -> UsageLimits:
+    def _usage_limits(self, entry: RegistryEntry, budget_usd: Decimal | None) -> UsageLimits:
         """The run's budget: the coding roles may make more requests than the others, and the
         USD budget also binds as tokens at the fallback price for a model that reports none."""
         limit = (
@@ -140,7 +153,7 @@ class AgentRunner:
             if entry.name in CODER_ROLES
             else self._settings.ra_request_limit
         )
-        budget = self._settings.ra_budget_usd
+        budget = budget_usd if budget_usd is not None else self._settings.ra_budget_usd
         return UsageLimits(
             request_limit=limit,
             cost_limit=budget,
