@@ -1,7 +1,7 @@
-"""Kernel Settings: the provider key, the models, and the Loop's limits.
+"""Kernel Settings: the provider keys, the Sign-in directory, the models, and the Loop's limits.
 
 Values come from environment variables (upper-cased field names) and, below them in
-precedence, the `.env` file at `REPO_ROOT`; `.env.example` documents them. The key is
+precedence, the `.env` file at `REPO_ROOT`; `.env.example` documents them. The keys are
 never printed or logged.
 """
 
@@ -16,7 +16,16 @@ from recursive_application.kernel.paths import REPO_ROOT
 
 ENV_FILENAME = ".env"
 API_KEY_VARIABLE = "OPENROUTER_API_KEY"
+"""The key for the `openrouter:` scheme."""
+
+OPENAI_API_KEY_VARIABLE = "OPENAI_API_KEY"
+"""The key for the `openai:` schemes, exported like the OpenRouter key."""
+
+CODEX_HOME_VARIABLE = "CODEX_HOME"
+"""The Codex CLI's own variable for the directory holding the Sign-in; the same name here."""
+
 LOGFIRE_TOKEN_VARIABLE = "LOGFIRE_TOKEN"
+"""The optional token that also sends traces to Logfire cloud."""
 
 
 class SettingsError(RuntimeError):
@@ -34,6 +43,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", env_ignore_empty=True)
 
     openrouter_api_key: str = Field(default="", repr=False)
+    openai_api_key: str = Field(default="", repr=False)
+    codex_home: Path = Field(default_factory=lambda: Path.home() / ".codex")
+    # The `originator` header the ChatGPT backend uses to tell clients apart; the Kernel names
+    # itself by default, and the Operator may set the Codex CLI's value explicitly.
+    ra_chatgpt_originator: str = "recursive_application"
     ra_model: str = "openrouter:anthropic/claude-sonnet-5"
     ra_judge_model: str = "openrouter:openai/gpt-5.4-mini"
     logfire_token: str | None = Field(default=None, repr=False)
@@ -46,11 +60,17 @@ class Settings(BaseSettings):
     ra_breaker_failures: int = 3
     ra_breaker_reset_s: int = 60
 
-    @field_validator("openrouter_api_key")
+    @field_validator("openrouter_api_key", "openai_api_key")
     @classmethod
     def _strip_key(cls, value: str) -> str:
         """Real environment variables are never stripped by anyone else, so do it here."""
         return value.strip()
+
+    @field_validator("codex_home")
+    @classmethod
+    def _expand_home(cls, value: Path) -> Path:
+        """Expand a leading `~`, which pydantic-settings leaves literal in a field value."""
+        return value.expanduser()
 
     def require_api_key(self) -> None:
         """Raise `SettingsError` naming `OPENROUTER_API_KEY` when the key is blank."""
@@ -63,14 +83,16 @@ class Settings(BaseSettings):
 def load_settings(env_file: Path | None = None) -> Settings:
     """Load `Settings` from the environment and `env_file` (default `REPO_ROOT/.env`).
 
-    Exports `OPENROUTER_API_KEY` and `LOGFIRE_TOKEN` into `os.environ` without overwriting
-    values already there, so Pydantic AI's OpenRouter provider and Logfire find them. A blank
-    variable counts as absent, as it does for `Settings` itself; a blank key or an absent token
-    is not exported.
+    Exports `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, and `LOGFIRE_TOKEN` into `os.environ`
+    without overwriting values already there, so Pydantic AI's providers and Logfire find them.
+    A blank variable counts as absent, as it does for `Settings` itself; a blank key or an
+    absent token is not exported.
     """
     settings = Settings(_env_file=env_file if env_file is not None else REPO_ROOT / ENV_FILENAME)
     if settings.openrouter_api_key and not os.environ.get(API_KEY_VARIABLE):
         os.environ[API_KEY_VARIABLE] = settings.openrouter_api_key
+    if settings.openai_api_key and not os.environ.get(OPENAI_API_KEY_VARIABLE):
+        os.environ[OPENAI_API_KEY_VARIABLE] = settings.openai_api_key
     if settings.logfire_token is not None and not os.environ.get(LOGFIRE_TOKEN_VARIABLE):
         os.environ[LOGFIRE_TOKEN_VARIABLE] = settings.logfire_token
     return settings

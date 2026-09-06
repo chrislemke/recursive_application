@@ -28,6 +28,9 @@ def test_with_no_file_and_no_variables_the_defaults_are_the_spec_literals() -> N
     assert settings.ra_coder_request_limit == 100
     assert settings.ra_breaker_failures == 3
     assert settings.ra_breaker_reset_s == 60
+    assert settings.openai_api_key == ""
+    assert settings.codex_home == Path.home() / ".codex"
+    assert settings.ra_chatgpt_originator == "recursive_application"
 
 
 def test_require_api_key_raises_the_settings_error_naming_the_variable_for_a_blank_key() -> None:
@@ -102,6 +105,28 @@ def test_an_env_file_is_parsed_with_whitespace_stripped_and_a_blank_token_as_non
     assert settings.ra_breaker_reset_s == 60
 
 
+def test_an_openai_key_from_the_environment_is_stripped_of_surrounding_whitespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", " sk-test ")
+
+    settings = load_settings(tmp_path / "absent.env")
+
+    assert settings.openai_api_key == "sk-test"
+
+
+def test_an_env_file_gives_the_openai_key_and_expands_the_tilde_in_codex_home(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "test.env"
+    env_file.write_text("OPENAI_API_KEY= sk-test \nCODEX_HOME=~/codex-alt\n")
+
+    settings = load_settings(env_file)
+
+    assert settings.openai_api_key == "sk-test"
+    assert settings.codex_home == Path.home() / "codex-alt"
+
+
 def test_load_settings_exports_the_key_and_the_token_into_the_process_environment(
     tmp_path: Path,
 ) -> None:
@@ -112,6 +137,28 @@ def test_load_settings_exports_the_key_and_the_token_into_the_process_environmen
 
     assert os.environ["OPENROUTER_API_KEY"] == "sk-or-test"
     assert os.environ["LOGFIRE_TOKEN"] == "lf-test"
+
+
+def test_load_settings_exports_the_openai_key_into_the_process_environment(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "test.env"
+    env_file.write_text("OPENAI_API_KEY=sk-test\n")
+
+    load_settings(env_file)
+
+    assert os.environ["OPENAI_API_KEY"] == "sk-test"
+
+
+def test_load_settings_does_not_rewrite_an_openai_key_the_operator_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", " sk-env ")
+
+    settings = load_settings(tmp_path / "absent.env")
+
+    assert settings.openai_api_key == "sk-env"
+    assert os.environ["OPENAI_API_KEY"] == " sk-env "
 
 
 def test_load_settings_leaves_an_already_set_variable_alone(
@@ -153,12 +200,24 @@ def test_a_blank_variable_in_the_environment_is_filled_from_the_file(
 
 def test_the_key_and_the_token_never_appear_in_the_settings_repr(tmp_path: Path) -> None:
     env_file = tmp_path / "test.env"
-    env_file.write_text("OPENROUTER_API_KEY=sk-or-test\nLOGFIRE_TOKEN=lf-test\n")
+    env_file.write_text(
+        "OPENROUTER_API_KEY=sk-or-test\nOPENAI_API_KEY=sk-test\nLOGFIRE_TOKEN=lf-test\n"
+    )
 
     settings = load_settings(env_file)
 
     assert "sk-or-test" not in repr(settings)
+    assert "sk-test" not in repr(settings)
     assert "lf-test" not in repr(settings)
+
+
+def test_load_settings_does_not_export_a_blank_openai_key(tmp_path: Path) -> None:
+    env_file = tmp_path / "test.env"
+    env_file.write_text("OPENAI_API_KEY=\n")
+
+    load_settings(env_file)
+
+    assert "OPENAI_API_KEY" not in os.environ
 
 
 def test_load_settings_does_not_export_a_blank_token(tmp_path: Path) -> None:

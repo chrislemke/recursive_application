@@ -101,6 +101,11 @@ def test_a_command_above_the_ceiling_reports_the_offending_part(command: str, na
         # The git directory, as a path prefix and as a whole token.
         ("cat .git/config", ".git"),
         ("ls .git", ".git"),
+        # The ChatGPT Sign-in directory, however the home directory is spelled: the shell tool
+        # has no path sandbox, and the harness file tool already refuses paths outside the root.
+        ("cat ~/.codex/auth.json", ".codex"),
+        ("cat $HOME/.codex/auth.json", ".codex"),
+        ("python -c \"open('/Users/x/.codex/auth.json')\"", ".codex"),
     ],
 )
 def test_a_command_reading_an_unreadable_path_reports_it(command: str, named: str) -> None:
@@ -109,7 +114,9 @@ def test_a_command_reading_an_unreadable_path_reports_it(command: str, named: st
     assert named in reason
 
 
-@pytest.mark.parametrize("command", ["cat .gitignore", "cat .env.example"])
+@pytest.mark.parametrize(
+    "command", ["cat .gitignore", "cat .env.example", "cat docs/codex-notes.md"]
+)
 def test_a_readable_neighbour_of_an_unreadable_path_has_no_reason(command: str) -> None:
     assert forbidden_reason(command) is None
 

@@ -87,6 +87,10 @@ _UNREADABLE_IN_COMMAND: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".env", re.compile(r"(?<![\w.])\.env(?![\w.])")),
     # `.git` as a token or a path prefix, but never `.gitignore`.
     (".git", re.compile(r"\.git(?:/|\b)")),
+    # `.codex`, the ChatGPT Sign-in directory, as a token or a path segment however the home
+    # directory is spelled, but never `codex-notes.md`. The file tool refuses paths outside the
+    # checkout on its own; the shell tool has no path sandbox.
+    (".codex", re.compile(r"(?<![\w.])\.codex(?![\w.])")),
 )
 
 
