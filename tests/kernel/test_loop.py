@@ -18,12 +18,13 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic_ai import Agent
 from pydantic_ai.usage import RequestUsage
 
 from recursive_application.kernel.breaker import BreakerStore
 from recursive_application.kernel.bundle import frontier_dir
 from recursive_application.kernel.checks import RedResult
-from recursive_application.kernel.evals import CaseResult, EvalReport
+from recursive_application.kernel.evals import CaseResult, EvalReport, ReportStore
 from recursive_application.kernel.git import Repo
 from recursive_application.kernel.loop import (
     ANSWER_RUBRIC,
@@ -36,12 +37,14 @@ from recursive_application.kernel.loop import (
     estimated_cost,
 )
 from recursive_application.kernel.paths import (
+    EVALS_DIRNAME,
     RA_DIRNAME,
     REPO_ROOT,
     RUNS_DIRNAME,
     TASKS_DIRNAME,
     TRACES_DIRNAME,
 )
+from recursive_application.kernel.policy import ToolConfig
 from recursive_application.kernel.records import (
     CapabilityGap,
     CheckResult,
@@ -55,7 +58,13 @@ from recursive_application.kernel.records import (
     TriageDecision,
     WorkerOutput,
 )
-from recursive_application.kernel.registry import load_registry
+from recursive_application.kernel.registry import (
+    CODING_GUIDE,
+    Registry,
+    RegistryEntry,
+    load_registry,
+    validate_registry,
+)
 from recursive_application.kernel.runtime import AgentRunner
 from recursive_application.kernel.sensors import (
     FINDINGS_FILENAME,
@@ -261,6 +270,8 @@ def _harness(
     on_call: Mapping[str, Callable[[], None]] | None = None,
     checks: Sequence[CheckResult] = (),
     red: RedResult = RED,
+    registry: Registry | None = None,
+    evals: Callable[[EvalRequest], EvalReport] | None = None,
 ) -> Harness:
     """A `LoopRunner` over the temporary checkout with every adapter replaced."""
     ra_dir = checkout / RA_DIRNAME
@@ -281,6 +292,8 @@ def _harness(
         harness_requests.append(request)
         if on_evals is not None:
             on_evals(request)
+        if evals is not None:
+            return evals(request)
         verdict = verdicts[min(len(harness_requests), len(verdicts)) - 1]
         return _report(request, passed=verdict)
 
@@ -306,7 +319,7 @@ def _harness(
 
     runner = LoopRunner(
         settings=settings,
-        registry=load_registry(),
+        registry=registry if registry is not None else load_registry(),
         agents=AgentRunner(settings, breakers, root=REPO_ROOT, model_factory=models),
         repo=Repo(checkout),
         wiki=Wiki(checkout / "wiki"),
@@ -1064,6 +1077,7 @@ def test_a_planner_clarification_gap_ends_the_run_with_its_question_like_triages
 GROWTH_REQUEST = "Teach the Worker to answer what the Gate is."
 GLOSSARY_PATH = "src/recursive_application/organism/glossary.py"
 GLOSSARY_TEST_PATH = "tests/organism/test_glossary.py"
+TARGET_KEY = "answers/answers-4-what-is-the-gate"
 GROWTH_CASE = EvalCase(
     name="answers-4-what-is-the-gate",
     inputs="What is the Gate?",
@@ -1206,6 +1220,7 @@ CODE_REPORT = CodeReport(
     checks=[CheckResult(name="pytest", passed=True)],
 )
 LIBRARIAN_SUMMARY = "Recorded the Improvement on the Wiki's capability page."
+LESSON_SUMMARY = "Recorded the lesson on the Wiki's lessons page."
 CHECKS_PASSED = [
     CheckResult(name="ruff-format", passed=True),
     CheckResult(name="ruff-check", passed=True),
@@ -1218,6 +1233,13 @@ GROWTH_SCRIPT: Mapping[str, Sequence[Any]] = {
     "implementer": [CODE_REPORT],
     "reviewer": [REVIEW_ACCEPT],
     "librarian": [LIBRARIAN_SUMMARY],
+}
+
+REJECTED_SCRIPT: Mapping[str, Sequence[Any]] = {
+    "planner": [GROWTH_PLAN],
+    "test_writer": [TEST_REPORT],
+    "implementer": [CODE_REPORT],
+    "librarian": [LESSON_SUMMARY],
 }
 
 
@@ -1306,7 +1328,7 @@ def test_the_gate_runs_the_guard_subset_and_the_librarian_records_the_improvemen
 
     request = harness.eval_requests[0]
     assert request.datasets == ["answers", "triage"]
-    assert request.targets == ["answers/answers-4-what-is-the-gate"]
+    assert request.targets == [TARGET_KEY]
     assert request.task_dataset is None
     assert len(harness.eval_requests) == 1
     prompt = harness.models.prompts_for("librarian")[0]
@@ -1334,11 +1356,7 @@ def test_a_failing_check_reaches_the_gate_with_its_output_and_stops_the_costlier
 ) -> None:
     harness = _harness(
         checkout,
-        {
-            "planner": [GROWTH_PLAN],
-            "test_writer": [TEST_REPORT],
-            "implementer": [CODE_REPORT],
-        },
+        REJECTED_SCRIPT,
         checks=CHECKS_TY_FAILED,
         on_call=_coder_effects(checkout),
         settings=_settings(ra_max_iterations=1),
@@ -1376,7 +1394,7 @@ REVIEW_REJECT = Review(
 )
 
 
-def test_a_reviewer_that_rejects_the_diff_fails_the_gate_and_nothing_is_committed(
+def test_a_reviewer_that_rejects_the_diff_fails_the_gate_and_the_improvement_is_not_committed(
     checkout: Path,
 ) -> None:
     repo = Repo(checkout)
@@ -1388,6 +1406,7 @@ def test_a_reviewer_that_rejects_the_diff_fails_the_gate_and_nothing_is_committe
             "test_writer": [TEST_REPORT],
             "implementer": [CODE_REPORT],
             "reviewer": [REVIEW_REJECT],
+            "librarian": [LESSON_SUMMARY],
         },
         checks=CHECKS_PASSED,
         on_call=_coder_effects(checkout),
@@ -1413,8 +1432,16 @@ def test_a_reviewer_that_rejects_the_diff_fails_the_gate_and_nothing_is_committe
         ("anomalies", "passed", ""),
         ("review", "failed", REVIEW_REJECT.notes),
     ]
-    assert repo.head_sha() == previous
-    assert harness.models.calls_for("librarian") == 0
+    assert repo.file_at("HEAD", GLOSSARY_PATH) is None
+    assert _git_output(checkout, "rev-parse", "HEAD~1") == previous
+    assert _git_output(checkout, "log", "-1", "--format=%s") == (
+        f"ra: lesson from {result.record.run_id}"
+    )
+    prompts = harness.models.prompts_for("librarian")
+    assert len(prompts) == 1
+    assert prompts[0].startswith("Rejected:")
+    assert f"review: {REVIEW_REJECT.notes}" in prompts[0]
+    assert "Improvement:" not in prompts[0]
 
 
 def test_a_refused_approval_leaves_the_tree_at_the_commit_it_started_from(checkout: Path) -> None:
@@ -1549,3 +1576,701 @@ def test_a_task_loop_that_escalates_runs_the_growth_loop_it_asked_for(checkout: 
     assert result.record.outcome == "accepted"
     assert result.record.iterations[-1].commit_sha is not None
     assert harness.models.calls_for("planner") == 2
+
+
+NOT_RED = RedResult(red=False, exit_code=0, output="1 passed")
+
+
+def test_a_red_check_that_is_not_red_rejects_the_iteration_and_resets_the_tree(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "librarian": [LESSON_SUMMARY]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        red=NOT_RED,
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == "no red: 1 passed"
+    assert iteration.test_report == TEST_REPORT
+    assert harness.models.calls_for("implementer") == 0
+    assert not (checkout / GLOSSARY_TEST_PATH).exists()
+    assert Repo(checkout).is_clean()
+
+
+@pytest.mark.parametrize(
+    "red",
+    [
+        RedResult(red=False, exit_code=5, output="no tests ran"),
+        RedResult(red=False, exit_code=2, output="SyntaxError: invalid syntax"),
+    ],
+    ids=["nothing-collected", "syntax-error"],
+)
+def test_a_red_check_the_checks_module_classified_as_not_red_is_trusted_whatever_its_exit_code(
+    checkout: Path, red: RedResult
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "librarian": [LESSON_SUMMARY]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        red=red,
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == f"no red: {red.output}"
+    assert harness.models.calls_for("implementer") == 0
+    assert Repo(checkout).is_clean()
+
+
+def test_a_plan_with_a_python_target_and_no_tests_is_refused_before_the_test_writer_runs(
+    checkout: Path,
+) -> None:
+    dataset = checkout / "evals" / "answers.yaml"
+    before = dataset.read_text(encoding="utf-8")
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [GROWTH_PLAN.model_copy(update={"tests": []})]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == "no tests"
+    assert harness.models.calls_for("test_writer") == 0
+    assert harness.models.calls_for("implementer") == 0
+    assert dataset.read_text(encoding="utf-8") == before
+    assert Repo(checkout).is_clean()
+
+
+WORKER_PROMPT_PATH = "src/recursive_application/organism/prompts/worker.md"
+PROMPT_SOURCE = (
+    "Phase: Act. You produce the Task's output as a `WorkerOutput`.\n\n"
+    "The Gate is the deterministic quality check an Iteration must pass.\n"
+)
+PROMPT_PLAN = GROWTH_PLAN.model_copy(update={"target_paths": [WORKER_PROMPT_PATH], "tests": []})
+PROMPT_REPORT = CodeReport(
+    summary="The Worker's prompt now says what the Gate is.", changed_files=[WORKER_PROMPT_PATH]
+)
+PROMPT_SCRIPT: Mapping[str, Sequence[Any]] = {
+    "planner": [PROMPT_PLAN],
+    "implementer": [PROMPT_REPORT],
+    "reviewer": [REVIEW_ACCEPT],
+    "librarian": [LIBRARIAN_SUMMARY],
+}
+
+
+def _prompt_effects(
+    checkout: Path, path: str = WORKER_PROMPT_PATH
+) -> dict[str, Callable[[], None]]:
+    """What a scripted Implementer that edits a prompt leaves behind in the checkout."""
+    return {"implementer": lambda: _write_file(checkout / path, PROMPT_SOURCE)}
+
+
+def test_a_plan_without_python_targets_skips_the_test_writer_and_the_red_check(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout, PROMPT_SCRIPT, checks=CHECKS_PASSED, on_call=_prompt_effects(checkout)
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert harness.models.calls_for("test_writer") == 0
+    assert harness.events == ["planner", "implementer", "checks", "evals", "reviewer", "librarian"]
+    assert harness.red_files == []
+
+
+def _seed_latest_report(checkout: Path, *cases: CaseResult) -> None:
+    """Persist a report as the latest one, so the Gate and the red have a baseline to read."""
+    ReportStore(checkout / RA_DIRNAME / EVALS_DIRNAME).save(
+        EvalReport(
+            created_at=START,
+            run_id="20260901-000000-abcdef",
+            datasets=sorted({case.dataset for case in cases}),
+            cases=list(cases),
+        )
+    )
+
+
+def test_a_non_python_plan_whose_target_case_already_passes_has_no_red_and_is_rejected_before_act(
+    checkout: Path,
+) -> None:
+    _seed_latest_report(
+        checkout, CaseResult(dataset="answers", name="answers-4-what-is-the-gate", passed=True)
+    )
+    harness = _harness(
+        checkout,
+        {**PROMPT_SCRIPT, "librarian": [LESSON_SUMMARY]},
+        checks=CHECKS_PASSED,
+        on_call=_prompt_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == f"no red: {TARGET_KEY}"
+    assert harness.models.calls_for("implementer") == 0
+    assert harness.eval_requests == []
+    assert Repo(checkout).is_clean()
+
+
+def _committed_paths(root: Path) -> list[str]:
+    """The paths HEAD's commit touches, read from git's own stat of it."""
+    stat = _git_output(root, "show", "--stat", "--format=", "HEAD")
+    return [line.split("|")[0].strip() for line in stat.splitlines() if "|" in line]
+
+
+def test_a_growth_iteration_the_gate_rejects_is_undone_and_recorded_as_a_lesson(
+    checkout: Path,
+) -> None:
+    repo = Repo(checkout)
+    previous = repo.head_sha()
+    log = checkout / "wiki" / "log.md"
+    harness = _harness(
+        checkout,
+        REJECTED_SCRIPT,
+        checks=CHECKS_TY_FAILED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    run_id = result.record.run_id
+    reason = f"ty: {TY_OUTPUT}"
+    assert result.record.iterations[0].outcome == "rejected"
+    assert _git_output(checkout, "rev-parse", "HEAD~1") == previous
+    assert _git_output(checkout, "log", "-1", "--format=%s") == f"ra: lesson from {run_id}"
+    touched = _committed_paths(checkout)
+    assert touched and all(path.startswith("wiki/") for path in touched)
+    assert not (checkout / GLOSSARY_PATH).exists()
+    assert not (checkout / GLOSSARY_TEST_PATH).exists()
+    assert repo.is_clean()
+    assert (harness.ra_dir / RUNS_DIRNAME / f"{run_id}.json").exists()
+    prompts = harness.models.prompts_for("librarian")
+    assert len(prompts) == 1
+    assert prompts[0].startswith("Rejected: Teach the Worker what the Gate is")
+    assert reason in prompts[0]
+    assert run_id in prompts[0]
+    assert GROWTH_PLAN.change in prompts[0]
+    assert "Phase: learn" in harness.models.requests["librarian"][0].instructions
+    assert (
+        log.read_text(encoding="utf-8")
+        .splitlines()[-1]
+        .endswith(f"rejected Teach the Worker what the Gate is: {reason}")
+    )
+
+
+def test_the_iteration_after_a_rejection_starts_on_a_clean_tree_and_its_planner_is_told_why(
+    checkout: Path,
+) -> None:
+    trees_at_planning: list[list[str]] = []
+    harness = _harness(
+        checkout,
+        {
+            "planner": [GROWTH_PLAN] * 2,
+            "test_writer": [TEST_REPORT] * 2,
+            "implementer": [CODE_REPORT] * 2,
+            "librarian": [LESSON_SUMMARY] * 2,
+        },
+        checks=CHECKS_TY_FAILED,
+        on_call={
+            **_coder_effects(checkout),
+            "planner": lambda: trees_at_planning.append(Repo(checkout).changed_paths()),
+        },
+        settings=_settings(ra_max_iterations=2, ra_no_progress_iterations=5),
+        usage=RequestUsage(input_tokens=10, output_tokens=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert [iteration.outcome for iteration in result.record.iterations] == ["rejected", "rejected"]
+    assert result.record.outcome == "aborted"
+    assert result.reason == "iteration limit"
+    assert trees_at_planning == [[], []]
+    second_prompt = harness.models.prompts_for("planner")[1]
+    assert f"Previous attempt failed because: ty: {TY_OUTPUT}" in second_prompt
+    assert harness.models.calls_for("librarian") == 2
+    assert result.record.iterations[0].usage.requests == 4
+    assert _git_output(checkout, "log", "--format=%s", "-3").splitlines() == [
+        f"ra: lesson from {result.record.run_id}",
+        f"ra: lesson from {result.record.run_id}",
+        "lay the checkout out",
+    ]
+
+
+def test_a_no_red_rejection_is_recorded_as_a_lesson_like_a_gate_rejection(checkout: Path) -> None:
+    repo = Repo(checkout)
+    previous = repo.head_sha()
+    harness = _harness(
+        checkout,
+        REJECTED_SCRIPT,
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        red=NOT_RED,
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    run_id = result.record.run_id
+    assert result.record.iterations[0].reason == "no red: 1 passed"
+    prompts = harness.models.prompts_for("librarian")
+    assert len(prompts) == 1
+    assert prompts[0].startswith("Rejected: Teach the Worker what the Gate is")
+    assert "no red: 1 passed" in prompts[0]
+    assert _git_output(checkout, "rev-parse", "HEAD~1") == previous
+    assert _git_output(checkout, "log", "-1", "--format=%s") == f"ra: lesson from {run_id}"
+    assert (
+        (checkout / "wiki" / "log.md")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+        .endswith("rejected Teach the Worker what the Gate is: no red: 1 passed")
+    )
+    assert result.record.iterations[0].usage.requests == 3
+
+
+SPECIALIST = RegistryEntry(
+    name="glossarist",
+    agent=Agent[None, Any](name="glossarist", output_type=CodeReport, retries=2),
+    tier="primary",
+    phases=("act",),
+    tools=ToolConfig(
+        write_globs=["src/recursive_application/organism/**"], shell_commands=["pytest"]
+    ),
+    guides=(CODING_GUIDE,),
+    # The harness reads prompts from the real checkout, where a test may add no file, so the
+    # Specialist borrows the Implementer's prompt; its own name is what the Loop dispatches on.
+    prompt_path="src/recursive_application/organism/prompts/implementer.md",
+    dataset="evals/answers.yaml",
+)
+SPECIALIST_PLAN = GROWTH_PLAN.model_copy(update={"actor": "glossarist"})
+
+
+def _specialist_registry() -> Registry:
+    """The real Organism registry plus the glossarist, held to the Kernel's contract."""
+    return validate_registry((*load_registry().entries, SPECIALIST), REPO_ROOT)
+
+
+def test_a_plan_naming_a_registered_specialist_invokes_it_in_the_act_slot_and_nowhere_else(
+    checkout: Path,
+) -> None:
+    effects = _coder_effects(checkout)
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [SPECIALIST_PLAN], "glossarist": [CODE_REPORT]},
+        checks=CHECKS_PASSED,
+        on_call={"test_writer": effects["test_writer"], "glossarist": effects["implementer"]},
+        registry=_specialist_registry(),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert harness.models.calls_for("glossarist") == 1
+    assert harness.models.calls_for("implementer") == 0
+    instructions = harness.models.requests["glossarist"][0].instructions
+    assert "Phase: act" in instructions
+    assert "Role: glossarist" in instructions
+    assert harness.events == [
+        "planner",
+        "test_writer",
+        "red check",
+        "glossarist",
+        "checks",
+        "evals",
+        "reviewer",
+        "librarian",
+    ]
+    assert result.record.iterations[0].code_report == CODE_REPORT
+
+
+def test_a_specialist_of_the_other_slots_contract_is_refused_as_ineligible_before_act(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN.model_copy(update={"actor": "glossarist"})],
+            "glossarist": [CODE_REPORT],
+            "worker": [WORKER_NOTE],
+        },
+        settings=_settings(ra_max_iterations=1),
+        registry=_specialist_registry(),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == "ineligible actor: glossarist"
+    assert harness.models.calls_for("glossarist") == 0
+    assert harness.models.calls_for("worker") == 0
+    assert harness.eval_requests == []
+
+
+def test_a_required_role_that_is_not_the_modes_default_actor_is_refused_as_ineligible(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [GROWTH_PLAN.model_copy(update={"actor": "planner"})]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == "ineligible actor: planner"
+    assert harness.models.calls_for("planner") == 1
+    assert harness.models.calls_for("test_writer") == 0
+    assert harness.models.calls_for("implementer") == 0
+    assert Repo(checkout).is_clean()
+
+
+PLANNER_PROMPT_PATH = "src/recursive_application/organism/prompts/planner.md"
+
+
+@pytest.mark.parametrize(
+    ("prompt_path", "datasets"),
+    [
+        (WORKER_PROMPT_PATH, ["answers", "triage"]),
+        (PLANNER_PROMPT_PATH, ["answers", "triage", "planner"]),
+    ],
+    ids=["worker-prompt", "planner-prompt"],
+)
+def test_the_guard_subset_is_the_target_dataset_triage_answers_and_the_affected_agents_datasets(
+    checkout: Path, prompt_path: str, datasets: list[str]
+) -> None:
+    plan = PROMPT_PLAN.model_copy(update={"target_paths": [prompt_path]})
+    report = CodeReport(
+        summary="The prompt now says what the Gate is.", changed_files=[prompt_path]
+    )
+    harness = _harness(
+        checkout,
+        {**PROMPT_SCRIPT, "planner": [plan], "implementer": [report]},
+        checks=CHECKS_PASSED,
+        on_call=_prompt_effects(checkout, prompt_path),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert len(harness.eval_requests) == 1
+    assert harness.eval_requests[0].datasets == datasets
+    assert harness.eval_requests[0].targets == [TARGET_KEY]
+
+
+TRIAGE_CASE = "triage-1-answer-from-current-capabilities"
+
+
+def _scripted_reports(*verdicts: Mapping[str, bool]) -> Callable[[EvalRequest], EvalReport]:
+    """An evals adapter answering each request in turn with a report over the given case keys."""
+    remaining = list(verdicts)
+
+    def run(request: EvalRequest) -> EvalReport:
+        cases = [
+            CaseResult(
+                dataset=key.rpartition("/")[0],
+                name=key.rpartition("/")[2],
+                passed=passed,
+                reasons=[] if passed else [JUDGE_REASON],
+            )
+            for key, passed in remaining.pop(0).items()
+        ]
+        return EvalReport(
+            created_at=START,
+            run_id=request.run_id,
+            datasets=sorted({case.dataset for case in cases}),
+            cases=cases,
+        )
+
+    return run
+
+
+def test_a_guard_case_that_regresses_is_retried_once_and_a_passing_retry_keeps_the_gate_green(
+    checkout: Path,
+) -> None:
+    _seed_latest_report(checkout, CaseResult(dataset="triage", name=TRIAGE_CASE, passed=True))
+    harness = _harness(
+        checkout,
+        PROMPT_SCRIPT,
+        checks=CHECKS_PASSED,
+        on_call=_prompt_effects(checkout),
+        evals=_scripted_reports(
+            {TARGET_KEY: True, f"triage/{TRIAGE_CASE}": False},
+            {f"triage/{TRIAGE_CASE}": True},
+        ),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert len(harness.eval_requests) == 2
+    assert harness.eval_requests[0].datasets == ["answers", "triage"]
+    assert harness.eval_requests[1].datasets == ["triage"]
+    assert harness.eval_requests[1].targets == [f"triage/{TRIAGE_CASE}"]
+    gate = result.record.iterations[0].gate
+    assert gate is not None
+    assert [check.status for check in gate.checks if check.name == "evals"] == ["passed"]
+
+
+def test_a_guard_case_whose_retry_fails_too_fails_the_gate_and_the_iteration_is_a_lesson(
+    checkout: Path,
+) -> None:
+    _seed_latest_report(checkout, CaseResult(dataset="triage", name=TRIAGE_CASE, passed=True))
+    harness = _harness(
+        checkout,
+        {**PROMPT_SCRIPT, "librarian": [LESSON_SUMMARY]},
+        checks=CHECKS_PASSED,
+        on_call=_prompt_effects(checkout),
+        evals=_scripted_reports(
+            {TARGET_KEY: True, f"triage/{TRIAGE_CASE}": False},
+            {f"triage/{TRIAGE_CASE}": False},
+        ),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert len(harness.eval_requests) == 2
+    assert iteration.gate is not None
+    assert [
+        (check.status, check.excerpt) for check in iteration.gate.checks if check.name == "evals"
+    ] == [("failed", f"triage/{TRIAGE_CASE}")]
+    assert harness.models.calls_for("reviewer") == 0
+    prompt = harness.models.prompts_for("librarian")[0]
+    assert prompt.startswith("Rejected:")
+    assert f"evals: triage/{TRIAGE_CASE}" in prompt
+    assert _git_output(checkout, "log", "-1", "--format=%s") == (
+        f"ra: lesson from {result.record.run_id}"
+    )
+    assert not (checkout / WORKER_PROMPT_PATH).exists()
+    assert Repo(checkout).is_clean()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/coding-guide.md",
+        "evals/frontier/text-analysis.yaml",
+        "src/recursive_application/kernel/policy.py",
+    ],
+    ids=["coding-guide", "frontier-file", "policy-ceiling"],
+)
+def test_a_plan_targeting_a_path_the_organism_may_not_change_becomes_a_policy_finding(
+    checkout: Path, path: str
+) -> None:
+    plan = GROWTH_PLAN.model_copy(update={"target_paths": [path]})
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [plan]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    run_id = result.record.run_id
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == f"policy: {path}"
+    assert harness.models.calls_for("test_writer") == 0
+    assert harness.models.calls_for("implementer") == 0
+    assert harness.approvals == []
+    assert Repo(checkout).is_clean()
+    findings = stored_findings(FindingStore(harness.ra_dir / FINDINGS_FILENAME))
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.id == f"policy:{run_id}:1"
+    assert finding.source == "policy"
+    assert finding.severity == "low"
+    assert finding.summary == (
+        f"Plan 'Teach the Worker what the Gate is' targets {path}, "
+        "which the Organism may not change"
+    )
+    assert finding.details == (
+        f"For the human: only you may change {path}. The Plan wanted:\n"
+        "Add a glossary module and the answers case that proves it."
+    )
+    sensed = collect(
+        ra_dir=harness.ra_dir,
+        wiki=Wiki(checkout / "wiki"),
+        frontier_dir=frontier_dir(checkout),
+        budget_usd=Decimal("5"),
+    )
+    assert finding.id in [sensed_finding.id for sensed_finding in sensed]
+
+
+FRONTIER_LADDER = "evals/frontier/text-analysis.yaml"
+
+
+def test_a_plan_whose_dataset_is_a_frontier_ladder_is_refused_as_policy_and_the_ladder_is_unchanged(
+    checkout: Path,
+) -> None:
+    ladder = checkout / FRONTIER_LADDER
+    before = ladder.read_text(encoding="utf-8")
+    plan = GROWTH_PLAN.model_copy(update={"dataset": FRONTIER_LADDER})
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [plan]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == f"policy: {FRONTIER_LADDER}"
+    assert ladder.read_text(encoding="utf-8") == before
+    assert harness.models.calls_for("test_writer") == 0
+    findings = stored_findings(FindingStore(harness.ra_dir / FINDINGS_FILENAME))
+    assert [finding.source for finding in findings] == ["policy"]
+    assert Repo(checkout).is_clean()
+
+
+@pytest.mark.parametrize(
+    "spell",
+    [lambda root: f"./{FRONTIER_LADDER}", lambda root: str(root / FRONTIER_LADDER)],
+    ids=["dot-relative", "absolute"],
+)
+def test_a_frontier_target_is_refused_however_its_path_is_spelled(
+    checkout: Path, spell: Callable[[Path], str]
+) -> None:
+    path = spell(checkout)
+    plan = GROWTH_PLAN.model_copy(update={"target_paths": [path]})
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "planner": [plan]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "rejected"
+    assert iteration.reason == f"policy: {path}"
+    assert harness.models.calls_for("test_writer") == 0
+
+
+def test_a_growth_run_that_crashes_after_the_append_leaves_the_tree_at_the_commit_it_started_from(
+    checkout: Path,
+) -> None:
+    repo = Repo(checkout)
+    previous = repo.head_sha()
+    dataset = checkout / "evals" / "answers.yaml"
+    before = dataset.read_text(encoding="utf-8")
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "implementer": [RuntimeError("the model is down")]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "error"
+    assert result.exit_code == 3
+    assert repo.head_sha() == previous
+    assert repo.is_clean()
+    assert dataset.read_text(encoding="utf-8") == before
+    assert not (checkout / GLOSSARY_TEST_PATH).exists()
+    assert not (harness.ra_dir / "lock").exists()
+
+
+def test_a_librarian_that_crashes_while_recording_an_improvement_leaves_one_iteration_behind(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "librarian": [RuntimeError("the model is down")]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "error"
+    assert [iteration.number for iteration in result.record.iterations] == [1]
+    iteration = result.record.iterations[0]
+    assert iteration.outcome == "error"
+    assert iteration.reason == "the model is down"
+    assert iteration.plan == GROWTH_PLAN
+    assert iteration.usage.requests == 4
+    assert _git_output(checkout, "log", "-1", "--format=%s") == f"ra: {GROWTH_PLAN.title}"
+    assert Repo(checkout).is_clean()
+
+
+def _persisting_evals(checkout: Path) -> Callable[[EvalRequest], EvalReport]:
+    """An evals adapter that, like the real runner, saves its report as the latest one."""
+    store = ReportStore(checkout / RA_DIRNAME / EVALS_DIRNAME)
+
+    def run(request: EvalRequest) -> EvalReport:
+        report = _report(request, passed=True)
+        store.save(report)
+        return report
+
+    return run
+
+
+def test_a_growth_gate_compares_against_the_report_that_was_latest_before_its_own_eval_run(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        GROWTH_SCRIPT,
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        evals=_persisting_evals(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, GROWTH_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert result.record.iterations[0].commit_sha is not None
+
+
+def test_an_answer_gate_compares_against_the_report_that_was_latest_before_its_own_eval_run(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {"triage": [TRIAGE_ANSWER], "worker": [WORKER_ANSWER]},
+        evals=_persisting_evals(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(None, TASK, LoopOptions())
+
+    assert result.record.outcome == "accepted"
+    assert result.exit_code == 0

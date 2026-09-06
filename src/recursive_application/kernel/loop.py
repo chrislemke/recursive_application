@@ -34,7 +34,12 @@ from recursive_application.kernel.evals import (
 )
 from recursive_application.kernel.gate import GateInputs, evaluate
 from recursive_application.kernel.git import Repo
-from recursive_application.kernel.paths import EVALS_DIRNAME, RUNS_DIRNAME, TASKS_DIRNAME
+from recursive_application.kernel.paths import (
+    EVALS_DIRNAME,
+    RUNS_DIRNAME,
+    TASKS_DIRNAME,
+    is_protected,
+)
 from recursive_application.kernel.records import (
     CapabilityGap,
     CheckResult,
@@ -56,8 +61,10 @@ from recursive_application.kernel.records import (
 )
 from recursive_application.kernel.registry import (
     EVALS_DIRNAME_TRACKED,
+    REQUIRED_ROLES,
     Phase,
     Registry,
+    RegistryError,
     affected_agents,
 )
 from recursive_application.kernel.runtime import (
@@ -106,10 +113,16 @@ APPROVAL_REFUSED = "approval refused"
 """The stop reason when the human turned the Plan, or an escalation to Growth, down."""
 
 UNKNOWN_ACTOR = "unknown actor"
-"""The reason an Iteration is refused before Act when its Plan names no eligible Actor."""
+"""The reason an Iteration is refused before Act when its Plan names an Actor no registry knows."""
+
+INELIGIBLE_ACTOR = "ineligible actor"
+"""The reason an Iteration is refused before Act when its Actor cannot fill this Mode's slot."""
 
 NO_TARGET_CASES = "no Target Cases"
 """The reason an Iteration is refused before Act when its Plan proves nothing (ADR 0010)."""
+
+POLICY = "policy"
+"""Why a Plan is refused before Act: it targets a path only the human may change (ADR 0010)."""
 
 RETRY_HEADING = "Previous attempt failed because:"
 """What a retrying Worker is told about the Iteration the judge turned down."""
@@ -135,6 +148,9 @@ PYTHON_SUFFIX = ".py"
 NO_RED = "no red"
 """The reason an Iteration is rejected: the tests the Test Writer wrote passed straight away."""
 
+NO_TESTS = "no tests"
+"""The reason a Plan with a Python target is refused before Act: code needs a red (ADR 0008)."""
+
 NO_DATASET = "no dataset"
 """The reason a frontier Plan is refused when no dataset under `evals/` holds its first case."""
 
@@ -144,6 +160,9 @@ DATASET_OUTSIDE_EVALS = "dataset outside evals/"
 
 COMMIT_MESSAGE_PREFIX = "ra: "
 """How every commit the Kernel writes begins, so an Improvement is one grep in the history."""
+
+REJECTED_PREFIX = "Rejected: "
+"""How the Librarian's summary of a rejected Iteration begins, before the Plan's title."""
 
 GUARD_DATASETS: tuple[str, ...] = ("triage", "answers")
 """The datasets every Growth Iteration guards, whatever else it changed."""
@@ -257,6 +276,7 @@ class _RunState:
     questions: list[str] = field(default_factory=list)
     no_progress: int = 0
     gaps_recorded: int = 0
+    policy_findings: int = 0
 
 
 def estimated_cost(usage: Usage) -> Decimal:
@@ -284,6 +304,39 @@ def _dataset_of(path: str) -> str:
     return dataset_name(Path(path), evals_dir=Path(EVALS_DIRNAME_TRACKED))
 
 
+def _has_python_target(plan: Plan) -> bool:
+    """Whether the Plan changes code, so the Test Writer and the red check run (ADR 0008)."""
+    return any(path.endswith(PYTHON_SUFFIX) for path in plan.target_paths)
+
+
+def _human_owned(path: str, root: Path) -> bool:
+    """Whether only the human may change `path`: a Protected Path, or a Frontier Case file.
+
+    The path rule covers the Kernel, the Coding Guide, and the Policy Ceiling; a Frontier Case
+    file sits under the writable `evals/`, so it is matched here, however its path is spelled
+    (ADR 0009).
+    """
+    if is_protected(path, root):
+        return True
+    absolute = Path(path) if Path(path).is_absolute() else root / path
+    return absolute.resolve().is_relative_to(frontier_dir(root).resolve())
+
+
+def _forbidden_target(plan: Plan, root: Path) -> str | None:
+    """The first path the Plan would change that only the human may, or `None`.
+
+    A Plan changes its `target_paths` and, when it names one, the dataset it appends to.
+    """
+    dataset = [plan.dataset] if plan.dataset is not None else []
+    changed = [*plan.target_paths, *dataset]
+    return next((path for path in changed if _human_owned(path, root)), None)
+
+
+def _passing(report: EvalReport | None, keys: Iterable[str]) -> list[str]:
+    """The case keys `report` holds a passing result for; a key with no entry is not passing."""
+    return [key for key in keys if (result := case_for(report, key)) is not None and result.passed]
+
+
 def _unique(names: Iterable[str]) -> list[str]:
     """The names in the order they were first named, without repeats."""
     return list(dict.fromkeys(names))
@@ -304,6 +357,17 @@ def _run_summary(
         f"Run: {run_id}\nCommit: {sha}\nDataset: {dataset}\n\n"
         f"Changed paths:\n{paths}\n\nGate: {checks}"
     )
+
+
+def _lesson_summary(plan: Plan, reason: str, *, run_id: str) -> str:
+    """What the Librarian records about a rejected Iteration: the Plan, its change, and why."""
+    return f"{REJECTED_PREFIX}{plan.title}\n\n{plan.change}\n\nRun: {run_id}\nReason: {reason}"
+
+
+def _rejection_reason(gate: GateResult) -> str:
+    """Why the Gate turned the Iteration down: the first failed check and its excerpt."""
+    check = next(check for check in gate.checks if check.status == "failed")
+    return f"{check.name}: {check.excerpt}"
 
 
 def _judge_reason(report: EvalReport | None, targets: Sequence[str]) -> str | None:
@@ -534,11 +598,18 @@ class LoopRunner:
             raise _StopError(DIRTY_TREE)
         with self._lock(state.record.run_id):
             number = first
-            while (rule := self._stop_rule(state, number)) is None:
-                if self._iteration(state, number, self._growth_act_of(state)):
-                    self._finish(state.record, "accepted")
-                    return LoopResult(record=state.record, output=state.output, exit_code=0)
-                number += 1
+            try:
+                while (rule := self._stop_rule(state, number)) is None:
+                    if self._iteration(state, number, self._growth_act_of(state)):
+                        self._finish(state.record, "accepted")
+                        return LoopResult(record=state.record, output=state.output, exit_code=0)
+                    number += 1
+            except Exception:
+                # A stop rule, a refusal, or a crash inside an Iteration leaves whatever the
+                # Kernel appended and the coders wrote; the tree was clean when the run began,
+                # so going back to HEAD destroys nothing the human owns (ADR 0002).
+                self._repo.reset_hard_clean()
+                raise
             return self._stopped(state, rule)
 
     @contextmanager
@@ -562,27 +633,28 @@ class LoopRunner:
         plan = self._plan(state, number)
         state.plan = plan
         actor = plan.actor or GROWTH_ACTOR
-        refusal = self._refusal_before_act(plan, actor, GROWTH_ACTOR) or self._dataset_refusal(plan)
+        refusal = self._refusal_before_act(
+            state, plan, actor, GROWTH_ACTOR
+        ) or self._dataset_refusal(plan)
         if refusal is not None:
             self._reject_before_act(state, number, started_at, plan, refusal)
             return False
         self._record_growth_gaps(state, plan.gaps)
         cases = self._growth_cases(plan)
         self._append_target_cases(plan)
-        try:
-            self._approve(state, _plan_yaml(plan))
-        except _StopError:
-            # The Kernel's own append must not survive a refusal: the tree goes back to HEAD.
-            self._repo.reset_hard_clean()
-            raise
+        self._approve(state, _plan_yaml(plan))
         test_report: CodeReport | None = None
-        if any(path.endswith(PYTHON_SUFFIX) for path in plan.target_paths):
+        if _has_python_target(plan):
             test_report = self._write_tests(state, number, plan)
             red = self._runners.red_check(self._root, self._changed_tests())
-            if not red.red:
-                reason = f"{NO_RED}: {red.output}"
-                self._reject_before_act(state, number, started_at, plan, reason, test_report)
-                return False
+            no_red_because = None if red.red else red.output
+        else:
+            no_red_because = self._passing_targets(cases)
+        if no_red_because is not None:
+            reason = f"{NO_RED}: {no_red_because}"
+            self._lesson(state, number, plan, reason)
+            self._reject_before_act(state, number, started_at, plan, reason, test_report)
+            return False
         code_report = self._act(state, number, plan, actor)
         return self._gate_iteration(
             state,
@@ -624,6 +696,15 @@ class LoopRunner:
         return [
             path for path in self._repo.changed_paths() if path.startswith(ORGANISM_TESTS_PREFIX)
         ]
+
+    def _passing_targets(self, cases: _TargetCases) -> str | None:
+        """The Target Cases the latest report already passes, or `None` when every one is red.
+
+        Without a Test Writer the Target Cases are the red (ADR 0008), so a case that already
+        passes leaves the Iteration nothing to turn green; a case with no entry in the latest
+        report counts as red, the baseline rule.
+        """
+        return ", ".join(_passing(self._latest_report(), cases.targets)) or None
 
     def _dataset_refusal(self, plan: Plan) -> str | None:
         """Why the Plan's dataset cannot be used: outside `evals/`, or no file holds its cases."""
@@ -720,13 +801,13 @@ class LoopRunner:
         try:
             return act(number, started_at)
         except _StopError as stop:
-            self._append_unfinished(state, number, started_at, "aborted", stop.reason)
+            self._record_unfinished(state, number, started_at, "aborted", stop.reason)
             raise
         except _EscalatedError:
-            self._append_unfinished(state, number, started_at, "rejected", "escalated to growth")
+            self._record_unfinished(state, number, started_at, "rejected", "escalated to growth")
             raise
         except Exception as error:
-            self._append_unfinished(state, number, started_at, "error", str(error))
+            self._record_unfinished(state, number, started_at, "error", str(error))
             raise
 
     def _task_act_of(self, state: _RunState) -> Callable[[int, datetime], bool]:
@@ -745,7 +826,7 @@ class LoopRunner:
         state.plan = plan
         self._handle_gaps(state, plan.gaps)
         actor = plan.actor or TASK_ACTOR
-        refusal = self._refusal_before_act(plan, actor, TASK_ACTOR)
+        refusal = self._refusal_before_act(state, plan, actor, TASK_ACTOR)
         if refusal is not None:
             self._reject_before_act(state, number, started_at, plan, refusal)
             return False
@@ -765,13 +846,23 @@ class LoopRunner:
         self._handle_gaps(state, output.gaps)
         return self._gate_iteration(state, number, started_at, cases, plan, content=output.content)
 
-    def _refusal_before_act(self, plan: Plan, actor: str, default_actor: str) -> str | None:
-        """Why the Kernel refuses this Plan before anything acts on it, or `None`."""
+    def _refusal_before_act(
+        self, state: _RunState, plan: Plan, actor: str, default_actor: str
+    ) -> str | None:
+        """Why the Kernel refuses this Plan before anything acts on it, or `None`.
+
+        The policy refusal comes first and leaves a finding, so a wish the Organism may not
+        fulfil reaches the human however malformed the rest of the Plan is.
+        """
+        forbidden = _forbidden_target(plan, self._root)
+        if forbidden is not None:
+            self._record_policy(state, plan, forbidden)
+            return f"{POLICY}: {forbidden}"
         if not plan.target_cases:
             return NO_TARGET_CASES
-        if not self._eligible(actor, default_actor):
-            return f"{UNKNOWN_ACTOR}: {actor}"
-        return None
+        if _has_python_target(plan) and not plan.tests:
+            return NO_TESTS
+        return self._actor_refusal(actor, default_actor)
 
     def _gate_iteration(
         self,
@@ -784,7 +875,7 @@ class LoopRunner:
         content: str | None = None,
         growth: _GrowthAct | None = None,
     ) -> bool:
-        """Gate of one Iteration, and Learn when the Gate passes.
+        """Gate of one Iteration, then Learn: the Librarian records the Improvement or the lesson.
 
         The Iteration is recorded before the Gate so the cost anomaly rule sees its spend, then
         updated with the verdict; every gatherer runs its evidence in `CHECK_ORDER`'s order and
@@ -802,14 +893,18 @@ class LoopRunner:
             usage=state.pending_usage,
         )
         self._runs.append_iteration(state.record, iteration)
+        growing = growth is not None and plan is not None
         verdict = (
             self._growth_gate(state, number, cases, plan)
-            if growth is not None and plan is not None
+            if growing and plan is not None
             else self._output_gate(state, number, cases, content or "", plan)
         )
         commit_sha: str | None = None
-        if verdict.gate.passed and growth is not None and plan is not None:
-            commit_sha = self._learn(state, number, plan, verdict, cases)
+        if growing and plan is not None:
+            if verdict.gate.passed:
+                commit_sha = self._learn(state, number, plan, verdict, cases)
+            else:
+                self._lesson(state, number, plan, _rejection_reason(verdict.gate))
         state.record.iterations[-1] = iteration.model_copy(
             update={
                 "gate": verdict.gate,
@@ -837,6 +932,7 @@ class LoopRunner:
         The Reviewer is the one check that costs a model call, so it runs only once the Target
         Cases and the trace anomalies have passed, and what it costs lands in this Iteration.
         """
+        baseline = self._latest_report()
         report = self._runners.evals(
             EvalRequest(
                 run_id=state.record.run_id,
@@ -846,7 +942,7 @@ class LoopRunner:
                 targets=cases.targets,
             )
         )
-        delta = compare(self._latest_report(), report, cases.targets)
+        delta = compare(baseline, report, cases.targets)
         inputs = GateInputs(
             mode=state.record.mode, eval_delta=delta, anomalies=self._anomalies(state)
         )
@@ -911,13 +1007,18 @@ class LoopRunner:
     def _growth_evals(
         self, state: _RunState, cases: _TargetCases, diff_paths: Sequence[str]
     ) -> tuple[EvalReport, EvalDelta, list[str]]:
-        """The Guard subset of one Iteration, with one retry for each Guard Case that regressed."""
+        """The Guard subset of one Iteration, with one retry for each Guard Case that regressed.
+
+        The baseline is read before the run, because the eval runner persists its report as the
+        latest one, and a report compared with itself shows neither progress nor regression.
+        """
         run_id = state.record.run_id
         datasets = _unique([cases.dataset, *GUARD_DATASETS, *self._affected_datasets(diff_paths)])
+        baseline = self._latest_report()
         report = self._runners.evals(
             EvalRequest(run_id=run_id, datasets=datasets, targets=cases.targets)
         )
-        delta = compare(self._latest_report(), report, cases.targets)
+        delta = compare(baseline, report, cases.targets)
         if not delta.guard_regressions:
             return report, delta, []
         retry = self._runners.evals(
@@ -927,12 +1028,7 @@ class LoopRunner:
                 targets=list(delta.guard_regressions),
             )
         )
-        retried = [
-            key
-            for key in delta.guard_regressions
-            if (result := case_for(retry, key)) is not None and result.passed
-        ]
-        return report, delta, retried
+        return report, delta, _passing(retry, delta.guard_regressions)
 
     def _affected_datasets(self, diff_paths: Sequence[str]) -> list[str]:
         """The datasets of the agents this diff touches: the rest of the Guard subset."""
@@ -948,9 +1044,9 @@ class LoopRunner:
         commit and the dataset as its breadcrumbs, and the Wiki's own changes are committed
         after it, so nothing unchecked rides into the Improvement's commit."""
         sha = self._repo.commit_all(f"{COMMIT_MESSAGE_PREFIX}{plan.title}")
-        result = self._call(
+        self._librarian_records(
             state,
-            "librarian",
+            number,
             _run_summary(
                 plan,
                 verdict.diff_paths,
@@ -959,15 +1055,37 @@ class LoopRunner:
                 sha=sha,
                 dataset=cases.dataset_path,
             ),
-            iteration=number,
-            phase="learn",
+            log_entry=f"Run {state.record.run_id}: accepted {plan.title}",
+            commit_message=f"{COMMIT_MESSAGE_PREFIX}record {plan.title}",
         )
+        return sha
+
+    def _librarian_records(
+        self, state: _RunState, number: int, summary: str, *, log_entry: str, commit_message: str
+    ) -> None:
+        """Learn, the shared shape: the Librarian writes through its Wiki tool, the Kernel
+        rebuilds the index, appends the log, and commits what the Wiki changed."""
+        result = self._call(state, "librarian", summary, iteration=number, phase="learn")
         state.pending_usage = state.pending_usage + result.usage
         self._wiki.rebuild_index()
-        self._wiki.append_log(f"Run {state.record.run_id}: accepted {plan.title}")
+        self._wiki.append_log(log_entry)
         if not self._repo.is_clean():
-            self._repo.commit_all(f"{COMMIT_MESSAGE_PREFIX}record {plan.title}")
-        return sha
+            self._repo.commit_all(commit_message)
+
+    def _lesson(self, state: _RunState, number: int, plan: Plan, reason: str) -> None:
+        """Learn from a rejected Growth Iteration: the tree goes back to HEAD, the Librarian
+        records the lesson, and the Wiki's changes are committed, so the next Iteration and the
+        next run start clean and the next Planner is told why (ADR 0008)."""
+        run_id = state.record.run_id
+        self._repo.reset_hard_clean()
+        self._librarian_records(
+            state,
+            number,
+            _lesson_summary(plan, reason, run_id=run_id),
+            log_entry=f"Run {run_id}: rejected {plan.title}: {reason}",
+            commit_message=f"{COMMIT_MESSAGE_PREFIX}lesson from {run_id}",
+        )
+        state.planner_reason = reason
 
     def _plan(self, state: _RunState, number: int) -> Plan:
         """Decide: the Planner turns the Task and the findings into a Definition of Done."""
@@ -1013,11 +1131,24 @@ class LoopRunner:
             targets=[f"{dataset}/{case.name}" for case in plan.target_cases],
         )
 
-    def _eligible(self, actor: str, default_actor: str) -> bool:
-        """Whether `actor` may fill this Mode's Act slot: the Mode's own agent, or a Specialist."""
-        return actor == default_actor or actor in {
-            entry.name for entry in self._registry.specialists
-        }
+    def _actor_refusal(self, actor: str, default_actor: str) -> str | None:
+        """Why `actor` may not fill this Mode's Act slot, or `None` when it may.
+
+        The Mode's own agent always may; a Specialist may when its output type is the slot's
+        contract (ADR 0007); a name no registry knows is unknown; anything else registered, a
+        required role that is not the default or a Specialist of the other slot's type, is
+        ineligible.
+        """
+        if actor == default_actor:
+            return None
+        try:
+            entry = self._registry.get(actor)
+        except RegistryError:
+            return f"{UNKNOWN_ACTOR}: {actor}"
+        contract = REQUIRED_ROLES[default_actor].output_type
+        if actor not in REQUIRED_ROLES and entry.agent.output_type is contract:
+            return None
+        return f"{INELIGIBLE_ACTOR}: {actor}"
 
     def _reject_before_act(
         self,
@@ -1074,15 +1205,33 @@ class LoopRunner:
     def _record_gap(self, state: _RunState, gap: CapabilityGap) -> None:
         """Learn: a gap nobody acted on becomes a `reflection` finding for the next run."""
         state.gaps_recorded += 1
-        FindingStore(self._ra_dir / FINDINGS_FILENAME).append(
+        self._add_finding(
             SensorFinding(
                 id=f"reflection:{state.record.run_id}:{state.gaps_recorded}",
                 source="reflection",
                 summary=gap.description,
                 details=_gap_details(gap),
                 severity="medium",
-            ),
-            self._runners.clock(),
+            )
+        )
+
+    def _add_finding(self, finding: SensorFinding) -> None:
+        """Write a finding the Kernel itself sensed, dated now, for the next run's Sense."""
+        FindingStore(self._ra_dir / FINDINGS_FILENAME).append(finding, self._runners.clock())
+
+    def _record_policy(self, state: _RunState, plan: Plan, path: str) -> None:
+        """Learn: a wish the Organism may not fulfil becomes a `policy` finding for the human."""
+        state.policy_findings += 1
+        self._add_finding(
+            SensorFinding(
+                id=f"{POLICY}:{state.record.run_id}:{state.policy_findings}",
+                source="policy",
+                summary=f"Plan '{plan.title}' targets {path}, which the Organism may not change",
+                details=(
+                    f"For the human: only you may change {path}. The Plan wanted:\n{plan.change}"
+                ),
+                severity="low",
+            )
         )
 
     def _escalate(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> NoReturn:
@@ -1134,20 +1283,19 @@ class LoopRunner:
         """
         reason = f"best effort: stopped by the {rule}; the judge never passed the Answer"
         run_id = state.record.run_id
-        FindingStore(self._ra_dir / FINDINGS_FILENAME).append(
+        self._add_finding(
             SensorFinding(
                 id=f"reflection:{run_id}:{BEST_EFFORT_FINDING_SUFFIX}",
                 source="reflection",
                 summary=f"Run {run_id} returned its Answer as best effort",
                 details=reason,
                 severity="medium",
-            ),
-            self._runners.clock(),
+            )
         )
         self._finish(state.record, "rejected")
         return LoopResult(record=state.record, output=state.output, reason=reason, exit_code=1)
 
-    def _append_unfinished(
+    def _record_unfinished(
         self,
         state: _RunState,
         number: int,
@@ -1155,20 +1303,34 @@ class LoopRunner:
         outcome: Outcome,
         reason: str | None,
     ) -> None:
-        """Record an Iteration that never reached the Gate: its Plan, its draft, its spend."""
-        self._runs.append_iteration(
-            state.record,
-            IterationRecord(
-                number=number,
-                started_at=started_at,
-                finished_at=self._runners.clock(),
-                plan=state.plan,
-                output_path=self._repo_relative(state.output_path) if state.output_path else None,
-                outcome=outcome,
-                reason=reason,
-                usage=state.pending_usage,
-            ),
+        """Record an Iteration that never finished: its Plan, its draft, its spend.
+
+        An Iteration is recorded before its Gate so the cost rule sees its spend; when Learn
+        then fails, that record is completed rather than followed by a second one.
+        """
+        iteration = IterationRecord(
+            number=number,
+            started_at=started_at,
+            finished_at=self._runners.clock(),
+            plan=state.plan,
+            output_path=self._repo_relative(state.output_path) if state.output_path else None,
+            outcome=outcome,
+            reason=reason,
+            usage=state.pending_usage,
         )
+        recorded = state.record.iterations
+        if recorded and recorded[-1].number == number:
+            recorded[-1] = recorded[-1].model_copy(
+                update={
+                    "finished_at": iteration.finished_at,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "usage": state.pending_usage,
+                }
+            )
+            self._runs.save(state.record)
+        else:
+            self._runs.append_iteration(state.record, iteration)
         state.pending_usage = Usage()
 
     def _answer_act(
