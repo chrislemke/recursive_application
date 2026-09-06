@@ -17,16 +17,17 @@ PLACEHOLDER = "<"
 """What marks a span as a shape rather than a path, as in `evals/<agent>.yaml`."""
 
 
+def backticked_spans(text: str) -> list[str]:
+    """Every single-backtick span of `text`, in order, duplicates kept."""
+    return [match.group(1) for match in _BACKTICK_SPAN.finditer(text)]
+
+
 def backticked_paths(text: str) -> list[str]:
     """Every single-backtick span of `text` that holds a path and no placeholder, in order.
 
     Duplicates are kept, because a pointer repeated is a pointer twice made.
     """
-    return [
-        span
-        for span in (match.group(1) for match in _BACKTICK_SPAN.finditer(text))
-        if "/" in span and PLACEHOLDER not in span
-    ]
+    return [span for span in backticked_spans(text) if "/" in span and PLACEHOLDER not in span]
 
 
 def missing_pointers(text: str, root: Path = REPO_ROOT) -> list[str]:
