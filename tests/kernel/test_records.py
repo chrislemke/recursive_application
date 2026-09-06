@@ -214,3 +214,11 @@ def test_plan_records_the_dataset_its_new_target_cases_are_appended_to() -> None
     assert restored == plan
     assert restored.dataset == "evals/answers.yaml"
     assert _plan().dataset is None
+
+
+def test_an_iteration_records_why_the_kernel_refused_it_before_act() -> None:
+    refused = IterationRecord(number=1, outcome="rejected", reason="unknown actor: specialist_x")
+    plain = IterationRecord(number=1)
+
+    assert refused.reason == "unknown actor: specialist_x"
+    assert plain.reason is None

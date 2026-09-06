@@ -1,4 +1,4 @@
-"""The Loop runner in Answer Mode, through `kernel.loop`.
+"""The Loop runner in Answer and Task Modes, through `kernel.loop`.
 
 The runner is the primary seam of the Loop: one `run(mode, task, options)` call drives Sense,
 Decide, Act, Gate, and Learn over injected adapters, so every test here scripts the models,
@@ -18,6 +18,7 @@ import yaml
 from pydantic_ai.usage import RequestUsage
 
 from recursive_application.kernel.breaker import BreakerStore
+from recursive_application.kernel.bundle import frontier_dir
 from recursive_application.kernel.checks import RedResult
 from recursive_application.kernel.evals import CaseResult, EvalReport
 from recursive_application.kernel.git import Repo
@@ -39,15 +40,23 @@ from recursive_application.kernel.paths import (
 )
 from recursive_application.kernel.records import (
     CapabilityGap,
+    EvalCase,
     Mode,
+    Plan,
     Reflection,
+    Review,
     RunStore,
     TriageDecision,
     WorkerOutput,
 )
 from recursive_application.kernel.registry import load_registry
 from recursive_application.kernel.runtime import AgentRunner
-from recursive_application.kernel.sensors import FINDINGS_FILENAME, FindingStore, stored_findings
+from recursive_application.kernel.sensors import (
+    FINDINGS_FILENAME,
+    FindingStore,
+    collect,
+    stored_findings,
+)
 from recursive_application.kernel.settings import Settings
 from recursive_application.organism.wiki import Wiki
 from tests.kernel.loop_support import ScriptedModels, scripted_models
@@ -90,6 +99,72 @@ TRIAGE_GROWTH = TriageDecision(
 WORKER_ANSWER = WorkerOutput(content=ANSWER)
 WORKER_SECOND_TRY = WorkerOutput(content=SECOND_ANSWER)
 
+TASK_REQUEST = "Write the release note for the Loop runner."
+DRAFT_NOTE = "The Loop runner runs one Iteration and stops."
+RELEASE_NOTE = "The Loop runs Sense, Decide, Act, Gate, and Learn. The Gate judges every Iteration."
+RUBRIC = "The note names the five phases of the Loop."
+TRIAGE_TASK = TriageDecision(
+    mode=Mode.TASK,
+    reasoning="The request needs Target Cases and more than one attempt.",
+    reflection=Reflection(
+        required_capabilities=["write a release note"], available=["write a release note"]
+    ),
+)
+TASK_PLAN = Plan(
+    title="Write the release note",
+    evidence="The request asks for a note that meets a stated Definition of Done.",
+    cause="The Loop runner has no release note yet.",
+    change="Draft the note against two Target Cases.",
+    target_cases=[
+        EvalCase(name="release-note-names-the-phases", inputs=TASK_REQUEST, rubric=RUBRIC),
+        EvalCase(
+            name="release-note-names-the-gate",
+            inputs=TASK_REQUEST,
+            expected_output="The Gate judges every Iteration.",
+            must_contain=["Gate", "Iteration"],
+        ),
+    ],
+    predicted_impact="Both Target Cases pass and no Guard Case regresses.",
+)
+TASK_CASES_YAML = {
+    "cases": [
+        {
+            "name": "release-note-names-the-phases",
+            "inputs": TASK_REQUEST,
+            "evaluators": [{"LLMJudge": {"rubric": RUBRIC, "include_input": True}}],
+        },
+        {
+            "name": "release-note-names-the-gate",
+            "inputs": TASK_REQUEST,
+            "expected_output": "The Gate judges every Iteration.",
+            "evaluators": [{"Contains": "Gate"}, {"Contains": "Iteration"}, "EqualsExpected"],
+        },
+    ]
+}
+PLAN_UNKNOWN_ACTOR = TASK_PLAN.model_copy(update={"actor": "specialist_x"})
+TOOL_GAP = CapabilityGap(
+    kind="tool",
+    description="The note cannot cite the repository's git history",
+    how_to_acquire="Expose the read-only git tools to an Act-phase agent",
+)
+PLAN_WITH_GAP = TASK_PLAN.model_copy(update={"gaps": [TOOL_GAP]})
+HUMAN_GAP = CapabilityGap(
+    kind="connection",
+    description="The note needs the release dates from the project's issue tracker",
+    how_to_acquire="Grant network access to a Specialist",
+    needs_human=["network access"],
+)
+PLAN_WITH_HUMAN_GAP = TASK_PLAN.model_copy(update={"gaps": [HUMAN_GAP]})
+WORKER_DRAFT = WorkerOutput(content=DRAFT_NOTE)
+WORKER_NOTE = WorkerOutput(content=RELEASE_NOTE)
+WORKER_OUTPUT_WITH_GAP = WorkerOutput(content=DRAFT_NOTE, gaps=[TOOL_GAP])
+REVIEW_ACCEPT = Review(
+    matches_plan=True,
+    gaming_suspected=False,
+    notes="The note does what the Plan says.",
+    verdict="accept",
+)
+
 
 class Clock:
     """The injected clock: it stands still until a test moves it."""
@@ -114,6 +189,7 @@ class Harness:
     clock: Clock
     ra_dir: Path
     eval_requests: list[EvalRequest] = field(default_factory=list)
+    approvals: list[str] = field(default_factory=list)
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -122,20 +198,23 @@ def _settings(**overrides: Any) -> Settings:
 
 
 def _report(request: EvalRequest, *, passed: bool) -> EvalReport:
-    """The report the evals runner returns for one Answer Iteration's Target Case."""
-    dataset, _, name = request.targets[0].rpartition("/")
-    return EvalReport(
-        created_at=START,
-        run_id=request.run_id,
-        datasets=[dataset],
-        cases=[
+    """The report the evals runner returns for one Iteration's Target Cases."""
+    cases = []
+    for key in request.targets:
+        dataset, _, name = key.rpartition("/")
+        cases.append(
             CaseResult(
                 dataset=dataset,
                 name=name,
                 passed=passed,
                 reasons=[] if passed else [JUDGE_REASON],
             )
-        ],
+        )
+    return EvalReport(
+        created_at=START,
+        run_id=request.run_id,
+        datasets=sorted({case.dataset for case in cases}),
+        cases=cases,
     )
 
 
@@ -143,7 +222,8 @@ def _harness(
     checkout: Path,
     script: Mapping[str, Sequence[Any]],
     *,
-    passes: bool = True,
+    passes: bool | Sequence[bool] = True,
+    approves: bool = True,
     settings: Settings | None = None,
     breakers: BreakerStore | None = None,
     clock: Clock | None = None,
@@ -157,12 +237,19 @@ def _harness(
     models = scripted_models(script, usage=usage)
     clock = clock if clock is not None else Clock()
     harness_requests: list[EvalRequest] = []
+    harness_approvals: list[str] = []
+    verdicts = [passes] if isinstance(passes, bool) else list(passes)
 
     def run_evals(request: EvalRequest) -> EvalReport:
         harness_requests.append(request)
         if on_evals is not None:
             on_evals(request)
-        return _report(request, passed=passes)
+        verdict = verdicts[min(len(harness_requests), len(verdicts)) - 1]
+        return _report(request, passed=verdict)
+
+    def approve(text: str) -> bool:
+        harness_approvals.append(text)
+        return approves
 
     def configure_tracing(run_id: str) -> Path:
         path = ra_dir / TRACES_DIRNAME / f"{run_id}.jsonl"
@@ -182,7 +269,7 @@ def _harness(
             checks=lambda root: [],
             red_check=lambda root, files: RedResult(red=True, exit_code=1),
             evals=run_evals,
-            approve=lambda text: True,
+            approve=approve,
             clock=clock,
             tracing=configure_tracing,
         ),
@@ -194,6 +281,7 @@ def _harness(
         clock=clock,
         ra_dir=ra_dir,
         eval_requests=harness_requests,
+        approvals=harness_approvals,
     )
 
 
@@ -509,3 +597,431 @@ def test_sense_hands_triage_the_open_findings_of_the_runtime_directory(checkout:
     harness.runner.run(None, TASK, LoopOptions())
 
     assert "evals:frontier/text-analysis" in harness.models.prompts_for("triage")[0]
+
+
+def test_a_task_loop_iterates_until_its_target_cases_pass_and_keeps_its_cases_out_of_the_tree(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN, TASK_PLAN],
+            "worker": [WORKER_DRAFT, WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT, REVIEW_ACCEPT],
+        },
+        passes=[False, True],
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert result.exit_code == 0
+    assert result.record.mode is Mode.TASK
+    assert result.record.outcome == "accepted"
+    assert [iteration.outcome for iteration in result.record.iterations] == ["rejected", "accepted"]
+    assert result.output == RELEASE_NOTE
+    run_id = result.record.run_id
+    cases_path = harness.ra_dir / TASKS_DIRNAME / run_id / CASES_FILENAME
+    assert yaml.safe_load(cases_path.read_text(encoding="utf-8")) == TASK_CASES_YAML
+    request = harness.eval_requests[0]
+    assert request.task_dataset == str(cases_path)
+    assert request.dataset == f"task-{run_id}"
+    assert request.targets == [
+        f"task-{run_id}/release-note-names-the-phases",
+        f"task-{run_id}/release-note-names-the-gate",
+    ]
+    assert Repo(checkout).is_clean()
+
+
+def test_the_reviewer_judges_the_task_iteration_whose_target_cases_passed_and_reaches_the_gate(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN, TASK_PLAN],
+            "worker": [WORKER_DRAFT, WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+        passes=[False, True],
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert harness.models.calls_for("reviewer") == 1
+    prompt = harness.models.prompts_for("reviewer")[0]
+    assert "title: Write the release note" in prompt
+    assert RELEASE_NOTE in prompt
+    accepted = result.record.iterations[1]
+    assert accepted.review == REVIEW_ACCEPT
+    assert accepted.gate is not None
+    assert [(check.name, check.status) for check in accepted.gate.checks] == [
+        ("evals", "passed"),
+        ("anomalies", "passed"),
+        ("review", "passed"),
+    ]
+    rejected = result.record.iterations[0]
+    assert rejected.gate is not None
+    assert [check.status for check in rejected.gate.checks] == ["failed", "skipped", "skipped"]
+
+
+def test_a_task_loop_whose_target_cases_never_pass_is_aborted_at_the_iteration_limit(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN, TASK_PLAN],
+            "worker": [WORKER_DRAFT, WORKER_DRAFT],
+        },
+        passes=False,
+        settings=_settings(ra_max_iterations=2, ra_no_progress_iterations=5),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert len(result.record.iterations) == 2
+    assert result.record.outcome == "aborted"
+    assert result.reason == "iteration limit"
+    assert result.exit_code == 2
+    assert harness.models.calls_for("reviewer") == 0
+
+
+def test_the_approval_shows_the_plan_and_its_target_cases_and_a_refusal_ends_the_run(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {"triage": [TRIAGE_TASK], "planner": [TASK_PLAN], "worker": [WORKER_NOTE]},
+        approves=False,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert len(harness.approvals) == 1
+    shown = harness.approvals[0]
+    assert "title: Write the release note" in shown
+    assert "release-note-names-the-phases" in shown
+    assert "release-note-names-the-gate" in shown
+    assert RUBRIC in shown
+    assert result.record.outcome == "aborted"
+    assert result.reason == "approval refused"
+    assert result.exit_code == 2
+    assert harness.models.calls_for("worker") == 0
+    assert [iteration.outcome for iteration in result.record.iterations] == ["aborted"]
+
+
+def test_the_yes_option_runs_the_task_loop_without_asking_the_human(checkout: Path) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+        approves=False,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert harness.approvals == []
+    assert result.record.outcome == "accepted"
+    assert result.exit_code == 0
+
+
+def test_the_actors_output_lands_in_the_runs_task_directory_and_the_iteration_points_at_it(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    run_id = result.record.run_id
+    iteration = result.record.iterations[0]
+    assert iteration.output_path == f".ra/{TASKS_DIRNAME}/{run_id}/output.md"
+    assert (checkout / iteration.output_path).read_text(encoding="utf-8") == RELEASE_NOTE
+    assert iteration.plan == TASK_PLAN
+    assert result.output == RELEASE_NOTE
+
+
+def test_a_plan_naming_an_actor_the_registry_does_not_know_is_rejected_before_the_act_phase(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [PLAN_UNKNOWN_ACTOR, TASK_PLAN],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert [iteration.outcome for iteration in result.record.iterations] == ["rejected", "accepted"]
+    rejected = result.record.iterations[0]
+    assert rejected.plan == PLAN_UNKNOWN_ACTOR
+    assert rejected.gate is None
+    assert rejected.output_path is None
+    assert harness.models.calls_for("worker") == 1
+    assert len(harness.eval_requests) == 1
+    assert "unknown actor: specialist_x" in harness.models.prompts_for("planner")[1]
+
+
+def test_a_plan_that_names_a_capability_gap_turns_the_run_into_a_growth_loop(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {"triage": [TRIAGE_TASK], "planner": [PLAN_WITH_GAP], "worker": [WORKER_NOTE]},
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert result.record.mode is Mode.GROWTH
+    assert len(harness.approvals) == 1
+    assert "mode: growth" in harness.approvals[0]
+    assert TOOL_GAP.description in harness.approvals[0]
+    assert harness.models.calls_for("worker") == 0
+    assert result.record.outcome == "error"
+    assert result.exit_code == 3
+
+
+def test_a_gap_the_actor_reports_turns_the_run_into_a_growth_loop_with_a_second_approval(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN],
+            "worker": [WorkerOutput(content=DRAFT_NOTE, gaps=[TOOL_GAP])],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert result.record.mode is Mode.GROWTH
+    assert len(harness.approvals) == 2
+    assert "title: Write the release note" in harness.approvals[0]
+    assert TOOL_GAP.description in harness.approvals[1]
+    assert harness.eval_requests == []
+    assert result.record.outcome == "error"
+    assert result.exit_code == 3
+
+
+def test_a_gap_only_the_human_can_close_becomes_a_reflection_finding_the_next_sense_sees(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [PLAN_WITH_HUMAN_GAP],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.mode is Mode.TASK
+    assert result.record.outcome == "accepted"
+    findings = stored_findings(FindingStore(harness.ra_dir / FINDINGS_FILENAME))
+    assert len(findings) == 1
+    assert findings[0].id == f"reflection:{result.record.run_id}:1"
+    assert findings[0].source == "reflection"
+    assert findings[0].severity == "medium"
+    assert findings[0].summary == HUMAN_GAP.description
+    assert findings[0].details == (
+        "kind: connection\n"
+        "how_to_acquire: Grant network access to a Specialist\n"
+        "needs_human: network access"
+    )
+    sensed = collect(
+        ra_dir=harness.ra_dir,
+        wiki=Wiki(checkout / "wiki"),
+        frontier_dir=frontier_dir(checkout),
+        budget_usd=Decimal("5"),
+    )
+    assert findings[0].id in [finding.id for finding in sensed]
+
+
+def test_two_iterations_the_kernel_refuses_before_act_stop_the_run_as_no_progress(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [PLAN_UNKNOWN_ACTOR, PLAN_UNKNOWN_ACTOR],
+            "worker": [WORKER_NOTE],
+        },
+        settings=_settings(ra_max_iterations=5, ra_no_progress_iterations=2),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert [iteration.outcome for iteration in result.record.iterations] == ["rejected", "rejected"]
+    assert result.record.outcome == "aborted"
+    assert result.reason == "no progress"
+    assert result.exit_code == 2
+    assert harness.models.calls_for("worker") == 0
+
+
+PLAN_WITHOUT_TARGETS = TASK_PLAN.model_copy(update={"target_cases": []})
+
+
+def test_a_plan_without_target_cases_is_refused_before_act_and_named_in_the_record(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [PLAN_WITHOUT_TARGETS, TASK_PLAN],
+            "worker": [WORKER_ANSWER],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+        settings=_settings(ra_no_progress_iterations=5),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert [iteration.number for iteration in result.record.iterations] == [1, 2]
+    assert result.record.iterations[0].outcome == "rejected"
+    assert result.record.iterations[0].reason == "no Target Cases"
+    assert result.record.outcome == "accepted"
+    assert harness.models.calls_for("worker") == 1
+
+
+def test_the_kernel_refuses_a_plan_before_asking_the_human_to_approve_it(checkout: Path) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN.model_copy(update={"actor": "specialist_x"}), TASK_PLAN],
+            "worker": [WORKER_ANSWER],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+        settings=_settings(ra_no_progress_iterations=5),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert result.record.iterations[0].reason == "unknown actor: specialist_x"
+    assert len(harness.approvals) == 1
+    assert "specialist_x" not in harness.approvals[0]
+    worker_prompt = harness.models.prompts_for("worker")[0]
+    assert "unknown actor" not in worker_prompt
+    planner_prompt = harness.models.prompts_for("planner")[1]
+    assert "unknown actor: specialist_x" in planner_prompt
+
+
+def test_the_reviewers_usage_lands_in_the_iteration_that_paid_for_it(checkout: Path) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN],
+            "worker": [WORKER_ANSWER],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+        usage=RequestUsage(input_tokens=10, output_tokens=1),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert harness.models.calls_for("reviewer") == 1
+    assert result.record.iterations[0].usage.requests == 4
+    assert result.record.total_usage.requests == 4
+
+
+def test_an_escalating_iteration_keeps_its_plan_and_its_draft_in_the_record(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN],
+            "worker": [WORKER_OUTPUT_WITH_GAP],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    iteration = result.record.iterations[0]
+    assert result.record.mode is Mode.GROWTH
+    assert iteration.plan == TASK_PLAN
+    assert iteration.output_path == f".ra/tasks/{result.record.run_id}/output.md"
+    assert (checkout / iteration.output_path).read_text(encoding="utf-8") == (
+        WORKER_OUTPUT_WITH_GAP.content
+    )
+
+
+def test_a_gap_triage_recognised_but_did_not_act_on_becomes_a_reflection_finding(
+    checkout: Path,
+) -> None:
+    triage_with_human_gap = TRIAGE_TASK.model_copy(
+        update={
+            "reflection": TRIAGE_TASK.reflection.model_copy(update={"gaps": [HUMAN_GAP]}),
+        }
+    )
+    harness = _harness(
+        checkout,
+        {
+            "triage": [triage_with_human_gap],
+            "planner": [TASK_PLAN],
+            "worker": [WORKER_ANSWER],
+            "reviewer": [REVIEW_ACCEPT],
+        },
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    findings = collect(
+        ra_dir=harness.ra_dir,
+        wiki=Wiki(checkout / "wiki"),
+        frontier_dir=checkout / "evals" / "frontier",
+        budget_usd=Decimal("5"),
+    )
+    assert f"reflection:{result.record.run_id}:1" in [finding.id for finding in findings]
+
+
+def test_a_planner_clarification_gap_ends_the_run_with_its_question_like_triages(
+    checkout: Path,
+) -> None:
+    unclear = TASK_PLAN.model_copy(
+        update={
+            "gaps": [
+                CapabilityGap(
+                    kind="clarification",
+                    description="Which release?",
+                    how_to_acquire="Ask the Operator which release the note is for.",
+                )
+            ]
+        }
+    )
+    harness = _harness(
+        checkout, {"triage": [TRIAGE_TASK], "planner": [unclear], "worker": [WORKER_ANSWER]}
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.reason == "clarification"
+    assert result.questions == ["Which release?"]
+    assert result.exit_code == 2
+    assert harness.models.calls_for("worker") == 0

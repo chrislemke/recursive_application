@@ -185,7 +185,11 @@ def _generate_run_id() -> str:
 
 
 class IterationRecord(Contract):
-    """One pass through the five phases and what it produced."""
+    """One pass through the five phases and what it produced.
+
+    `reason` is the Kernel's own word for an Iteration it refused before Act or that a rule
+    ended, so the Run Record says why without a reader having to replay the run.
+    """
 
     number: int
     started_at: datetime = Field(default_factory=_now)
@@ -197,6 +201,7 @@ class IterationRecord(Contract):
     gate: GateResult | None = None
     review: Review | None = None
     outcome: Outcome | None = None
+    reason: str | None = None
     commit_sha: str | None = None
     usage: Usage = Usage()
 

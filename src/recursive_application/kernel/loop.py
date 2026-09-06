@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, NoReturn
 
 import yaml
 from pydantic import Field
@@ -26,11 +26,15 @@ from recursive_application.kernel.gate import GateInputs, evaluate
 from recursive_application.kernel.git import Repo
 from recursive_application.kernel.paths import EVALS_DIRNAME, RUNS_DIRNAME, TASKS_DIRNAME
 from recursive_application.kernel.records import (
+    CapabilityGap,
     CheckResult,
     Contract,
+    EvalCase,
     IterationRecord,
     Mode,
     Outcome,
+    Plan,
+    Review,
     RunRecord,
     RunStore,
     SensorFinding,
@@ -74,6 +78,22 @@ OUTPUT_FILENAME = "output.md"
 
 ANSWER_CASE_PREFIX = "answer-"
 """How the Kernel names the one Target Case it writes for an Answer Mode run."""
+
+TASK_DATASET_PREFIX = "task-"
+"""How the Kernel names the runtime dataset a Task Loop run's Target Cases are reported under."""
+
+TASK_ACTOR = "worker"
+"""The registry entry that fills the Act slot of a Task Iteration when the Plan names none."""
+
+APPROVAL_REFUSED = "approval refused"
+"""The stop reason when the human turned the Plan, or an escalation to Growth, down."""
+
+UNKNOWN_ACTOR = "unknown actor"
+"""The reason an Iteration is refused before Act when its Plan names no eligible Actor."""
+
+NO_TARGET_CASES = "no Target Cases"
+"""The reason an Iteration is refused before Act when its Plan proves nothing (ADR 0010)."""
+"""Why the Kernel refuses an Iteration before Act: the Plan named an Actor it may not invoke."""
 
 RETRY_HEADING = "Previous attempt failed because:"
 """What a retrying Worker is told about the Iteration the judge turned down."""
@@ -134,10 +154,9 @@ class LoopResult:
 
 
 @dataclass(frozen=True)
-class _AnswerTask:
-    """What every Iteration of one Answer run shares: the Task and its one Target Case."""
+class _TargetCases:
+    """The Definition of Done as the Kernel wrote it: the runtime dataset and its case keys."""
 
-    task: str
     cases_path: Path
     dataset: str
     targets: list[str]
@@ -153,11 +172,17 @@ class _RunState:
     budget_usd: Decimal
     iteration_limit: int
     max_minutes: int
+    skip_approval: bool = False
     pending_usage: Usage = field(default_factory=Usage)
     output: str | None = None
     previous_gate: Literal["passed", "failed"] | None = None
     judge_reason: str | None = None
+    planner_reason: str | None = None
+    plan: Plan | None = None
+    output_path: Path | None = None
+    questions: list[str] = field(default_factory=list)
     no_progress: int = 0
+    gaps_recorded: int = 0
 
 
 def estimated_cost(usage: Usage) -> Decimal:
@@ -194,6 +219,61 @@ class _StopError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def _escalates(gap: CapabilityGap) -> bool:
+    """Whether this gap turns the run into a Growth Loop, rather than waiting for the human."""
+    return gap.kind != "clarification" and not gap.needs_human
+
+
+def _gap_details(gap: CapabilityGap) -> str:
+    """A gap as a `reflection` finding records it: its kind, its cure, and what it needs granted."""
+    return "\n".join(
+        [
+            f"kind: {gap.kind}",
+            f"how_to_acquire: {gap.how_to_acquire}",
+            f"needs_human: {', '.join(gap.needs_human)}",
+        ]
+    )
+
+
+def _plan_yaml(plan: Plan) -> str:
+    """The Plan as an agent and the human read it: YAML, in the contract's own field order."""
+    return yaml.safe_dump(plan.model_dump(mode="json"), sort_keys=False)
+
+
+def _case_spec(case: EvalCase) -> dict[str, Any]:
+    """One Target Case as pydantic-evals reads it: its texts, its expected output, its rubric."""
+    spec: dict[str, Any] = {"name": case.name, "inputs": case.inputs}
+    evaluators: list[Any] = [{"Contains": text} for text in case.must_contain]
+    if case.expected_output is not None:
+        spec["expected_output"] = case.expected_output
+        evaluators.append("EqualsExpected")
+    if case.rubric is not None:
+        evaluators.append({"LLMJudge": {"rubric": case.rubric, "include_input": True}})
+    spec["evaluators"] = evaluators
+    return spec
+
+
+def _planner_prompt(task: str, findings: Sequence[SensorFinding], reason: str | None) -> str:
+    """The Task as the Planner sees it: the request, the findings, and the last failure."""
+    prompt = f"Task: {task}\n\nOpen Sensor Findings:\n{_findings_block(findings)}"
+    if reason is None:
+        return prompt
+    return f"{prompt}\n\n{RETRY_HEADING} {reason}"
+
+
+def _actor_prompt(task: str, plan: Plan, reason: str | None) -> str:
+    """The Task as the Actor sees it: the request, its Definition of Done, and the last failure."""
+    prompt = f"Task: {task}\n\nPlan:\n{_plan_yaml(plan)}"
+    if reason is None:
+        return prompt
+    return f"{prompt}\n{RETRY_HEADING} {reason}"
+
+
+def _review_prompt(plan: Plan, output: str) -> str:
+    """What the Reviewer judges: the Plan the Iteration followed and the output it produced."""
+    return f"Plan:\n{_plan_yaml(plan)}\n\nOutput:\n{output}"
 
 
 def _findings_block(findings: Sequence[SensorFinding]) -> str:
@@ -239,6 +319,7 @@ class LoopRunner:
             budget_usd=options.budget_usd or self._settings.ra_budget_usd,
             iteration_limit=options.max_iterations or self._settings.ra_max_iterations,
             max_minutes=options.max_minutes or self._settings.ra_max_minutes,
+            skip_approval=options.yes,
         )
         try:
             state.findings = self._sense(state.budget_usd)
@@ -247,10 +328,20 @@ class LoopRunner:
                 record.mode = decision.mode
                 if any(gap.kind == "clarification" for gap in decision.reflection.gaps):
                     return self._clarification(state, decision)
-            if record.mode is not Mode.ANSWER:
-                raise NotImplementedError(f"the Loop runner does not run Mode {record.mode} yet")
-            return self._answer(state)
+                for gap in decision.reflection.gaps:
+                    if gap.needs_human:
+                        self._record_gap(state, gap)
+            if record.mode is Mode.ANSWER:
+                return self._answer(state)
+            if record.mode is Mode.TASK:
+                return self._task(state)
+            self._unsupported(record.mode)
         except _StopError as stop:
+            if stop.reason == "clarification":
+                self._finish(state.record, "aborted")
+                return LoopResult(
+                    record=state.record, reason=stop.reason, questions=state.questions, exit_code=2
+                )
             return self._stopped(state, stop.reason)
         except Exception as error:
             return self._errored(state, error)
@@ -302,19 +393,274 @@ class LoopRunner:
     def _answer(self, state: _RunState) -> LoopResult:
         """Answer Mode: no Planner; the Worker answers and the judge is the Gate."""
         case_name = _answer_case_name(state.record.run_id)
-        answer = _AnswerTask(
-            task=state.record.task or "",
+        cases = _TargetCases(
             cases_path=self._write_answer_cases(state.record.run_id, state.record.task or ""),
             dataset=case_name,
             targets=[f"{case_name}/{case_name}"],
         )
         number = 1
         while (rule := self._stop_rule(state, number)) is None:
-            if self._answer_iteration(state, number, answer):
+            if self._iteration(state, number, self._answer_act_of(state, cases)):
                 self._finish(state.record, "accepted")
                 return LoopResult(record=state.record, output=state.output, exit_code=0)
             number += 1
         return self._stopped(state, rule)
+
+    def _unsupported(self, mode: Mode) -> NoReturn:
+        """A Mode this runner does not drive yet ends the run as an internal error."""
+        raise NotImplementedError(f"the Loop runner does not run Mode {mode} yet")
+
+    def _task(self, state: _RunState) -> LoopResult:
+        """Task Loop: the Planner states the Definition of Done and the Actor works against it."""
+        number = 1
+        while (rule := self._stop_rule(state, number)) is None:
+            if self._iteration(state, number, self._task_act_of(state)):
+                self._finish(state.record, "accepted")
+                return LoopResult(record=state.record, output=state.output, exit_code=0)
+            number += 1
+        return self._stopped(state, rule)
+
+    def _iteration(
+        self, state: _RunState, number: int, act: Callable[[int, datetime], bool]
+    ) -> bool:
+        """One Iteration, recorded however it ends: a stop rule or a crash still leaves it in
+        the Run Record with the Plan it had and the usage it spent."""
+        started_at = self._runners.clock()
+        state.plan = None
+        try:
+            return act(number, started_at)
+        except _StopError as stop:
+            self._append_unfinished(state, number, started_at, "aborted", stop.reason)
+            raise
+        except Exception as error:
+            self._append_unfinished(state, number, started_at, "error", str(error))
+            raise
+
+    def _task_act_of(self, state: _RunState) -> Callable[[int, datetime], bool]:
+        """The Task Iteration's Act as `_iteration` drives it, bound to this run's state."""
+        return lambda number, started_at: self._task_act(state, number, started_at)
+
+    def _answer_act_of(
+        self, state: _RunState, cases: _TargetCases
+    ) -> Callable[[int, datetime], bool]:
+        """The Answer Iteration's Act as `_iteration` drives it, bound to this run's cases."""
+        return lambda number, started_at: self._answer_act(state, number, cases, started_at)
+
+    def _task_act(self, state: _RunState, number: int, started_at: datetime) -> bool:
+        """Decide, Act, and Gate of one Task Iteration: the Plan, the Actor, and the judgement."""
+        plan = self._plan(state, number)
+        state.plan = plan
+        self._handle_gaps(state, plan.gaps)
+        actor = plan.actor or TASK_ACTOR
+        refusal = self._refusal_before_act(plan, actor)
+        if refusal is not None:
+            self._reject_before_act(state, number, started_at, plan, refusal)
+            return False
+        cases = self._write_task_cases(state, plan)
+        self._approve(state, _plan_yaml(plan))
+        result = self._call(
+            state,
+            actor,
+            _actor_prompt(state.record.task or "", plan, state.judge_reason),
+            iteration=number,
+            phase="act",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        output: WorkerOutput = result.output
+        state.output = output.content
+        state.output_path = self._write_output(state.record.run_id, output.content)
+        self._handle_gaps(state, output.gaps)
+        return self._gate_iteration(state, number, started_at, cases, output.content, plan)
+
+    def _refusal_before_act(self, plan: Plan, actor: str) -> str | None:
+        """Why the Kernel refuses this Plan before anything acts on it, or `None`."""
+        if not plan.target_cases:
+            return NO_TARGET_CASES
+        if not self._eligible(actor):
+            return f"{UNKNOWN_ACTOR}: {actor}"
+        return None
+
+    def _gate_iteration(
+        self,
+        state: _RunState,
+        number: int,
+        started_at: datetime,
+        cases: _TargetCases,
+        content: str,
+        plan: Plan | None,
+    ) -> bool:
+        """Gate of one Iteration: the Target Cases, the traces, and, in a Task Loop, the Reviewer.
+
+        The Iteration is recorded before the Gate so the cost anomaly rule sees its spend, then
+        updated with the verdict; the Reviewer, the one check that costs a model call, runs only
+        once the cheaper evidence has passed, and what it costs lands in the same Iteration.
+        """
+        report = self._runners.evals(
+            EvalRequest(
+                run_id=state.record.run_id,
+                task_dataset=str(cases.cases_path),
+                dataset=cases.dataset,
+                output=content,
+                targets=cases.targets,
+            )
+        )
+        delta = compare(self._latest_report(), report, cases.targets)
+        iteration = IterationRecord(
+            number=number,
+            started_at=started_at,
+            finished_at=self._runners.clock(),
+            plan=plan,
+            output_path=self._repo_relative(state.output_path) if state.output_path else None,
+            outcome="rejected",
+            usage=state.pending_usage,
+        )
+        self._runs.append_iteration(state.record, iteration)
+        inputs = GateInputs(
+            mode=state.record.mode, eval_delta=delta, anomalies=self._anomalies(state)
+        )
+        gate = evaluate(inputs)
+        review: Review | None = None
+        if plan is not None and gate.failed_checks == ["review"]:
+            review = self._review(state, number, plan, content)
+            gate = evaluate(inputs.model_copy(update={"review": review}))
+        state.record.iterations[-1] = iteration.model_copy(
+            update={
+                "gate": gate,
+                "review": review,
+                "outcome": "accepted" if gate.passed else "rejected",
+                "finished_at": self._runners.clock(),
+                "usage": state.pending_usage,
+            }
+        )
+        self._runs.save(state.record)
+        state.pending_usage = Usage()
+        progress = [case for case in delta.newly_passing if case in cases.targets]
+        state.no_progress = 0 if progress else state.no_progress + 1
+        state.judge_reason = _judge_reason(report, cases.targets)
+        state.previous_gate = "passed" if gate.passed else "failed"
+        return gate.passed
+
+    def _plan(self, state: _RunState, number: int) -> Plan:
+        """Decide: the Planner turns the Task and the findings into a Definition of Done."""
+        result = self._call(
+            state,
+            "planner",
+            _planner_prompt(
+                state.record.task or "",
+                state.findings,
+                state.planner_reason or state.judge_reason,
+            ),
+            iteration=number,
+            phase="decide",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        state.planner_reason = None
+        plan: Plan = result.output
+        return plan
+
+    def _review(self, state: _RunState, number: int, plan: Plan, content: str) -> Review:
+        """Gate: the Reviewer judges the output against the Plan it was meant to follow."""
+        result = self._call(
+            state,
+            "reviewer",
+            _review_prompt(plan, content),
+            iteration=number,
+            phase="gate",
+        )
+        state.pending_usage = state.pending_usage + result.usage
+        review: Review = result.output
+        return review
+
+    def _write_task_cases(self, state: _RunState, plan: Plan) -> _TargetCases:
+        """Write the Plan's Target Cases as runtime data for this run, never into `evals/`."""
+        run_id = state.record.run_id
+        dataset = f"{TASK_DATASET_PREFIX}{run_id}"
+        path = self._task_dir(run_id) / CASES_FILENAME
+        specs = [_case_spec(case) for case in plan.target_cases]
+        path.write_text(yaml.safe_dump({"cases": specs}, sort_keys=False), encoding="utf-8")
+        return _TargetCases(
+            cases_path=path,
+            dataset=dataset,
+            targets=[f"{dataset}/{case.name}" for case in plan.target_cases],
+        )
+
+    def _eligible(self, actor: str) -> bool:
+        """Whether `actor` may fill the Act slot of a Task Iteration: the Worker or a Specialist."""
+        return actor == TASK_ACTOR or actor in {entry.name for entry in self._registry.specialists}
+
+    def _reject_before_act(
+        self, state: _RunState, number: int, started_at: datetime, plan: Plan, reason: str
+    ) -> None:
+        """An Iteration the Kernel refuses before Act: no Gate, no progress, the Planner told.
+
+        The reason goes on the record and to the next Planner; the Actor never sees it, since
+        it is not a judgement of any output.
+        """
+        self._runs.append_iteration(
+            state.record,
+            IterationRecord(
+                number=number,
+                started_at=started_at,
+                finished_at=self._runners.clock(),
+                plan=plan,
+                outcome="rejected",
+                reason=reason,
+                usage=state.pending_usage,
+            ),
+        )
+        state.pending_usage = Usage()
+        state.no_progress += 1
+        state.planner_reason = reason
+
+    def _approve(self, state: _RunState, text: str) -> None:
+        """Show the human what the run is about to do; a refusal ends the run where it stands."""
+        if state.skip_approval:
+            return
+        if not self._runners.approve(text):
+            raise _StopError(APPROVAL_REFUSED)
+
+    def _handle_gaps(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> None:
+        """A Capability Gap escalates to Growth; one the human must grant is recorded instead;
+        a clarification gap ends the run with its question, as Triage's does."""
+        questions = [gap.description for gap in gaps if gap.kind == "clarification"]
+        if questions:
+            state.questions = questions
+            raise _StopError("clarification")
+        for gap in gaps:
+            if not _escalates(gap):
+                self._record_gap(state, gap)
+        escalating = [gap for gap in gaps if _escalates(gap)]
+        if escalating:
+            self._escalate(state, escalating)
+
+    def _record_gap(self, state: _RunState, gap: CapabilityGap) -> None:
+        """Learn: a gap nobody acted on becomes a `reflection` finding for the next run."""
+        state.gaps_recorded += 1
+        FindingStore(self._ra_dir / FINDINGS_FILENAME).append(
+            SensorFinding(
+                id=f"reflection:{state.record.run_id}:{state.gaps_recorded}",
+                source="reflection",
+                summary=gap.description,
+                details=_gap_details(gap),
+                severity="medium",
+            ),
+            self._runners.clock(),
+        )
+
+    def _escalate(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> NoReturn:
+        """The Task needs a capability the Organism lacks, so the run becomes a Growth Loop."""
+        state.record.mode = Mode.GROWTH
+        self._approve(
+            state,
+            yaml.safe_dump(
+                {
+                    "mode": Mode.GROWTH.value,
+                    "gaps": [gap.model_dump(mode="json") for gap in gaps],
+                },
+                sort_keys=False,
+            ),
+        )
+        self._unsupported(Mode.GROWTH)
 
     def _stop_rule(self, state: _RunState, number: int) -> str | None:
         """The rule that ends the run before Iteration `number`, or `None` to go on."""
@@ -330,8 +676,13 @@ class LoopRunner:
         return None
 
     def _stopped(self, state: _RunState, rule: str) -> LoopResult:
-        """The run hit a stop rule: best effort when there is an Answer, aborted otherwise."""
-        if rule in BEST_EFFORT_RULES and state.output is not None:
+        """The run hit a stop rule: best effort when there is an Answer, aborted otherwise.
+
+        Only an Answer comes back as best effort: a Task Loop's output is judged against the
+        Target Cases the human approved, so an output that never passed them is not a result.
+        """
+        answered = state.record.mode is Mode.ANSWER and state.output is not None
+        if rule in BEST_EFFORT_RULES and answered:
             return self._best_effort(state, rule)
         self._finish(state.record, "aborted")
         return LoopResult(record=state.record, output=state.output, reason=rule, exit_code=2)
@@ -358,86 +709,46 @@ class LoopRunner:
         self._finish(state.record, "rejected")
         return LoopResult(record=state.record, output=state.output, reason=reason, exit_code=1)
 
-    def _answer_iteration(self, state: _RunState, number: int, answer: _AnswerTask) -> bool:
-        """One Answer Iteration: the Worker acts, the judge and the Sensors gate it.
-
-        Whatever ends the Iteration early, a stop rule or a crash, it is still appended to the
-        Run Record with the usage it spent, so nothing the run paid for goes unrecorded.
-        """
-        started_at = self._runners.clock()
-        try:
-            return self._act_and_gate(state, number, answer, started_at)
-        except _StopError:
-            self._append_unfinished(state, number, started_at, "aborted")
-            raise
-        except Exception:
-            self._append_unfinished(state, number, started_at, "error")
-            raise
-
     def _append_unfinished(
-        self, state: _RunState, number: int, started_at: datetime, outcome: Outcome
+        self,
+        state: _RunState,
+        number: int,
+        started_at: datetime,
+        outcome: Outcome,
+        reason: str | None,
     ) -> None:
-        """Record an Iteration that never reached the Gate, with what it spent so far."""
+        """Record an Iteration that never reached the Gate: its Plan, its draft, its spend."""
         self._runs.append_iteration(
             state.record,
             IterationRecord(
                 number=number,
                 started_at=started_at,
                 finished_at=self._runners.clock(),
+                plan=state.plan,
+                output_path=self._repo_relative(state.output_path) if state.output_path else None,
                 outcome=outcome,
+                reason=reason,
                 usage=state.pending_usage,
             ),
         )
         state.pending_usage = Usage()
 
-    def _act_and_gate(
-        self, state: _RunState, number: int, answer: _AnswerTask, started_at: datetime
+    def _answer_act(
+        self, state: _RunState, number: int, cases: _TargetCases, started_at: datetime
     ) -> bool:
         """Act and Gate of one Answer Iteration: the Worker's output against the judge."""
         result = self._call(
             state,
             "worker",
-            _worker_prompt(answer.task, state.judge_reason),
+            _worker_prompt(state.record.task or "", state.judge_reason),
             iteration=number,
             phase="act",
         )
         state.pending_usage = state.pending_usage + result.usage
         output: WorkerOutput = result.output
         state.output = output.content
-        output_path = self._write_output(state.record.run_id, output.content)
-        report = self._runners.evals(
-            EvalRequest(
-                run_id=state.record.run_id,
-                task_dataset=str(answer.cases_path),
-                dataset=answer.dataset,
-                output=output.content,
-                targets=answer.targets,
-            )
-        )
-        delta = compare(self._latest_report(), report, answer.targets)
-        iteration = IterationRecord(
-            number=number,
-            started_at=started_at,
-            finished_at=self._runners.clock(),
-            output_path=self._repo_relative(output_path),
-            outcome="rejected",
-            usage=state.pending_usage,
-        )
-        # The Iteration is recorded before the Gate, so the cost anomaly rule sees its spend.
-        self._runs.append_iteration(state.record, iteration)
-        state.pending_usage = Usage()
-        gate = evaluate(
-            GateInputs(mode=Mode.ANSWER, eval_delta=delta, anomalies=self._anomalies(state))
-        )
-        state.record.iterations[-1] = iteration.model_copy(
-            update={"gate": gate, "outcome": "accepted" if gate.passed else "rejected"}
-        )
-        self._runs.save(state.record)
-        progress = [case for case in delta.newly_passing if case in answer.targets]
-        state.no_progress = 0 if progress else state.no_progress + 1
-        state.judge_reason = _judge_reason(report, answer.targets)
-        state.previous_gate = "passed" if gate.passed else "failed"
-        return gate.passed
+        state.output_path = self._write_output(state.record.run_id, output.content)
+        return self._gate_iteration(state, number, started_at, cases, output.content, None)
 
     def _call(
         self,
