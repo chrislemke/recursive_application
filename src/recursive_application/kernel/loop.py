@@ -314,7 +314,7 @@ def _judge_reason(report: EvalReport | None, targets: Sequence[str]) -> str | No
     return "; ".join(result.reasons) or "the judge gave no reason"
 
 
-class _Escalated(Exception):
+class _EscalatedError(Exception):
     """A Task Loop found a Capability Gap and, with the human's approval, becomes Growth."""
 
 
@@ -705,7 +705,7 @@ class LoopRunner:
                     self._finish(state.record, "accepted")
                     return LoopResult(record=state.record, output=state.output, exit_code=0)
                 number += 1
-        except _Escalated:
+        except _EscalatedError:
             state.judge_reason = None
             return self._growth(state, first=len(state.record.iterations) + 1)
         return self._stopped(state, rule)
@@ -722,7 +722,7 @@ class LoopRunner:
         except _StopError as stop:
             self._append_unfinished(state, number, started_at, "aborted", stop.reason)
             raise
-        except _Escalated:
+        except _EscalatedError:
             self._append_unfinished(state, number, started_at, "rejected", "escalated to growth")
             raise
         except Exception as error:
@@ -1098,7 +1098,7 @@ class LoopRunner:
                 sort_keys=False,
             ),
         )
-        raise _Escalated()
+        raise _EscalatedError()
 
     def _stop_rule(self, state: _RunState, number: int) -> str | None:
         """The rule that ends the run before Iteration `number`, or `None` to go on."""
