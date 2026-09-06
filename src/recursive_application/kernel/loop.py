@@ -139,6 +139,40 @@ DIRTY_TREE = "dirty working tree"
 LOCK_HELD = "lock held"
 """Why a Growth Loop refuses to start: another run of this checkout is already changing it."""
 
+GROWTH_NEEDED_TWICE = "growth needed twice"
+"""Why an `ra ask` run stops after its Improvement: Triage, asked again, still needs Growth."""
+
+ADDED_PREFIX = "Added: "
+"""How the output of a run stopped by `GROWTH_NEEDED_TWICE` begins, before the Improvement."""
+
+STILL_MISSING_HEADING = "Still missing:"
+"""The heading in that output over the gaps the Improvement did not close, one per line."""
+
+TASK_HEADING = "Task:"
+"""How a decider's prompt begins in `ra ask`: the Task, as the human wrote it."""
+
+FINDING_HEADING = "Finding:"
+"""How the Planner's prompt in `ra improve` begins: the top Sensor Finding, by id, to plan from."""
+
+GOAL_HEADING = "Goal:"
+"""How that prompt begins instead when the human gave `ra improve` a goal to steer growth by."""
+
+NO_OPEN_FINDINGS = "no open findings"
+"""The stop rule of `ra improve` without a goal: Sense returned nothing left to plan from."""
+
+IMPROVE_LIMIT_RULES: tuple[str, ...] = (
+    "iteration limit",
+    "wall time",
+    "budget",
+    "no progress",
+    NO_OPEN_FINDINGS,
+)
+"""The limits that end an `ra improve` run as accepted once it has made an Improvement; a
+refused approval or an open breaker still aborts it."""
+
+Command = Literal["ask", "improve"]
+"""The CLI command a run serves: `ra ask` decides the Mode, `ra improve` grows from findings."""
+
 GROWTH_ACTOR = "implementer"
 """The registry entry that fills the Act slot of a Growth Iteration when the Plan names none."""
 
@@ -266,6 +300,11 @@ class _RunState:
     iteration_limit: int
     max_minutes: int
     skip_approval: bool = False
+    command: Command | None = None
+    retriaged: bool = False
+    goal: str | None = None
+    finding: SensorFinding | None = None
+    added: str | None = None
     pending_usage: Usage = field(default_factory=Usage)
     output: str | None = None
     previous_gate: Literal["passed", "failed"] | None = None
@@ -359,6 +398,22 @@ def _run_summary(
     )
 
 
+def _command_of(mode: Mode | None, task: str | None) -> Command | None:
+    """Which CLI command a `run` call serves; `None` when a Mode was given with a Task."""
+    if mode is None:
+        return "ask"
+    if mode is Mode.GROWTH and task is None:
+        return "improve"
+    return None
+
+
+def _growth_twice_output(added: str, gaps: Sequence[CapabilityGap]) -> str:
+    """What a run that needs Growth twice tells the human: the Improvement it made, by title
+    and commit, and the gaps that are still open (spec, user story 16)."""
+    missing = "".join(f"\n- {gap.description}" for gap in gaps)
+    return f"{ADDED_PREFIX}{added}\n\n{STILL_MISSING_HEADING}{missing}"
+
+
 def _lesson_summary(plan: Plan, reason: str, *, run_id: str) -> str:
     """What the Librarian records about a rejected Iteration: the Plan, its change, and why."""
     return f"{REJECTED_PREFIX}{plan.title}\n\n{plan.change}\n\nRun: {run_id}\nReason: {reason}"
@@ -380,6 +435,15 @@ def _judge_reason(report: EvalReport | None, targets: Sequence[str]) -> str | No
 
 class _EscalatedError(Exception):
     """A Task Loop found a Capability Gap and, with the human's approval, becomes Growth."""
+
+
+class _GrowthTwiceError(Exception):
+    """A continued Task Loop found a Capability Gap after the run's one Improvement; `gaps` is
+    what the human is told is still missing."""
+
+    def __init__(self, gaps: Sequence[CapabilityGap]) -> None:
+        super().__init__(GROWTH_NEEDED_TWICE)
+        self.gaps = list(gaps)
 
 
 class _StopError(Exception):
@@ -441,17 +505,38 @@ def _case_spec(case: EvalCase) -> dict[str, Any]:
     return spec
 
 
-def _planner_prompt(task: str, findings: Sequence[SensorFinding], reason: str | None) -> str:
-    """The Task as the Planner sees it: the request, the findings, and the last failure."""
-    prompt = f"Task: {task}\n\nOpen Sensor Findings:\n{_findings_block(findings)}"
+def _decide_prompt(subject: str, findings: Sequence[SensorFinding], reason: str | None) -> str:
+    """What a decider reads: its subject, the open findings, and the last failure, if any.
+
+    Triage's subject is the Task; the Planner's is the Task, the goal, or the finding to close.
+    """
+    prompt = f"{subject}\n\nOpen Sensor Findings:\n{_findings_block(findings)}"
     if reason is None:
         return prompt
     return f"{prompt}\n\n{RETRY_HEADING} {reason}"
 
 
+def _finding_lines(finding: SensorFinding) -> str:
+    """One Sensor Finding as the Planner's subject: its id, then its summary and details."""
+    lines = [f"{FINDING_HEADING} {finding.id}", finding.summary, finding.details]
+    return "\n".join(line for line in lines if line)
+
+
+def _plan_subject(task: str | None, goal: str | None, finding: SensorFinding | None) -> str:
+    """What a Plan is for: the Task in `ra ask`; in `ra improve` the human's goal, or else the
+    finding the run singled out to close."""
+    if task is not None:
+        return f"{TASK_HEADING} {task}"
+    if goal is not None:
+        return f"{GOAL_HEADING} {goal}"
+    if finding is None:
+        raise ValueError("a Plan needs a Task, a goal, or a finding")
+    return _finding_lines(finding)
+
+
 def _actor_prompt(task: str, plan: Plan, reason: str | None) -> str:
     """The Task as the Actor sees it: the request, its Definition of Done, and the last failure."""
-    prompt = f"Task: {task}\n\nPlan:\n{_plan_yaml(plan)}"
+    prompt = f"{TASK_HEADING} {task}\n\nPlan:\n{_plan_yaml(plan)}"
     if reason is None:
         return prompt
     return f"{prompt}\n{RETRY_HEADING} {reason}"
@@ -496,7 +581,11 @@ class LoopRunner:
         self._runs = RunStore(ra_dir / RUNS_DIRNAME)
 
     def run(self, mode: Mode | None, task: str | None, options: LoopOptions) -> LoopResult:
-        """Run one Loop for `task` and return its record, its output, and its exit code."""
+        """Run one Loop and return its record, its output, and its exit code.
+
+        `mode=None` with a Task is `ra ask`, where Triage decides; `Mode.GROWTH` with no Task
+        is `ra improve`, which grows from the open Sensor Findings or the goal.
+        """
         record = RunRecord(mode=mode or Mode.ANSWER, task=task, started_at=self._runners.clock())
         state = _RunState(
             record=record,
@@ -506,22 +595,14 @@ class LoopRunner:
             iteration_limit=options.max_iterations or self._settings.ra_max_iterations,
             max_minutes=options.max_minutes or self._settings.ra_max_minutes,
             skip_approval=options.yes,
+            command=_command_of(mode, task),
+            goal=options.goal,
         )
         try:
             state.findings = self._sense(state.budget_usd)
             if mode is None:
-                decision = self._triage(state)
-                record.mode = decision.mode
-                if any(gap.kind == "clarification" for gap in decision.reflection.gaps):
-                    return self._clarification(state, decision)
-                for gap in decision.reflection.gaps:
-                    if gap.needs_human:
-                        self._record_gap(state, gap)
-            if record.mode is Mode.ANSWER:
-                return self._answer(state)
-            if record.mode is Mode.TASK:
-                return self._task(state)
-            return self._growth(state)
+                return self._decide(state, 1, record.started_at)
+            return self._loop(state, 1)
         except _StopError as stop:
             if stop.reason == "clarification":
                 self._finish(state.record, "aborted")
@@ -532,13 +613,15 @@ class LoopRunner:
         except Exception as error:
             return self._errored(state, error)
 
-    def _clarification(self, state: _RunState, decision: TriageDecision) -> LoopResult:
+    def _clarification(
+        self, state: _RunState, decision: TriageDecision, number: int, started_at: datetime
+    ) -> LoopResult:
         """Decide: Triage cannot place the Task without the human, so nothing else runs."""
         self._runs.append_iteration(
             state.record,
             IterationRecord(
-                number=1,
-                started_at=state.record.started_at,
+                number=number,
+                started_at=started_at,
                 finished_at=self._runners.clock(),
                 outcome="aborted",
                 usage=state.pending_usage,
@@ -566,17 +649,83 @@ class LoopRunner:
             budget_usd=budget_usd,
         )
 
-    def _triage(self, state: _RunState) -> TriageDecision:
-        """Decide: Triage reflects on the Task and the findings and picks the Mode."""
-        prompt = (
-            f"Task: {state.record.task}\n\nOpen Sensor Findings:\n{_findings_block(state.findings)}"
+    def _decide(self, state: _RunState, number: int, started_at: datetime) -> LoopResult:
+        """Decide: Triage reflects on the Task, and the run goes on as the Mode it picks.
+
+        A clarification gap ends the run with its questions; a gap only the human can grant is
+        recorded for the next run; the Mode's loop then starts at Iteration `number`, unless
+        the run has grown once already and Triage wants Growth again, which ends it.
+        """
+        decision = self._triage(state, number)
+        state.record.mode = decision.mode
+        gaps = decision.reflection.gaps
+        if any(gap.kind == "clarification" for gap in gaps):
+            return self._clarification(state, decision, number, started_at)
+        for gap in gaps:
+            if gap.needs_human:
+                self._record_gap(state, gap)
+        if decision.mode is Mode.GROWTH and state.retriaged:
+            for gap in gaps:
+                if not gap.needs_human:
+                    self._record_gap(state, gap)
+            self._record_unfinished(state, number, started_at, "rejected", GROWTH_NEEDED_TWICE)
+            return self._growth_twice(state, gaps)
+        return self._loop(state, number)
+
+    def _growth_twice(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> LoopResult:
+        """The run grew once and the Task still needs Growth: it stops here, and the output
+        names what was added and what is still missing (spec, user story 16)."""
+        if state.added is None:
+            raise ValueError("a run needs Growth twice only after an Improvement")
+        self._finish(state.record, "rejected")
+        return LoopResult(
+            record=state.record,
+            output=_growth_twice_output(state.added, gaps),
+            reason=GROWTH_NEEDED_TWICE,
+            exit_code=1,
         )
-        result = self._call(state, "triage", prompt, iteration=1, phase="decide")
+
+    def _loop(self, state: _RunState, first: int) -> LoopResult:
+        """The record's Mode as a loop, from Iteration `first`."""
+        if state.record.mode is Mode.ANSWER:
+            return self._answer(state, first)
+        if state.record.mode is Mode.TASK:
+            return self._task(state, first)
+        return self._growth(state, first)
+
+    def _retriage(self, state: _RunState) -> LoopResult:
+        """Decide again: the Organism grew, so Triage places the original Task once more and
+        the run goes on as the Mode it now picks, in the same Run Record and under the same
+        stop rules (spec, user story 16).
+
+        The judge's and the Planner's reasons, the no-progress count, and a draft from before
+        the Improvement belong to the loops that ended, so the continued loop starts without
+        them; and it starts only when the run's limits leave room for an Iteration, so a Triage
+        nothing could follow is never paid for.
+        """
+        state.retriaged = True
+        state.judge_reason = None
+        state.planner_reason = None
+        state.no_progress = 0
+        state.plan = None
+        state.output = None
+        state.output_path = None
+        number = len(state.record.iterations) + 1
+        rule = self._stop_rule(state, number)
+        if rule is not None:
+            return self._stopped(state, rule)
+        state.findings = self._sense(state.budget_usd)
+        return self._decide(state, number, self._runners.clock())
+
+    def _triage(self, state: _RunState, iteration: int) -> TriageDecision:
+        """Decide: Triage reflects on the Task and the findings and picks the Mode."""
+        prompt = _decide_prompt(f"{TASK_HEADING} {state.record.task}", state.findings, None)
+        result = self._call(state, "triage", prompt, iteration=iteration, phase="decide")
         state.pending_usage = state.pending_usage + result.usage
         decision: TriageDecision = result.output
         return decision
 
-    def _answer(self, state: _RunState) -> LoopResult:
+    def _answer(self, state: _RunState, first: int) -> LoopResult:
         """Answer Mode: no Planner; the Worker answers and the judge is the Gate."""
         case_name = _answer_case_name(state.record.run_id)
         cases = _TargetCases(
@@ -584,7 +733,7 @@ class LoopRunner:
             dataset=case_name,
             targets=[f"{case_name}/{case_name}"],
         )
-        number = 1
+        number = first
         while (rule := self._stop_rule(state, number)) is None:
             if self._iteration(state, number, self._answer_act_of(state, cases)):
                 self._finish(state.record, "accepted")
@@ -592,8 +741,23 @@ class LoopRunner:
             number += 1
         return self._stopped(state, rule)
 
-    def _growth(self, state: _RunState, first: int = 1) -> LoopResult:
-        """Growth Loop: the Organism changes itself, on a clean tree and under the lock."""
+    def _growth(self, state: _RunState, first: int) -> LoopResult:
+        """Growth Loop: the Organism changes itself, on a clean tree and under the lock.
+
+        An accepted Improvement ends the run, unless the run is `ra ask`, which then asks
+        Triage again with the lock released, since the continued loop changes no code.
+        """
+        rule = self._growth_iterations(state, first)
+        if rule is not None:
+            return self._stopped(state, rule)
+        if state.command == "ask":
+            return self._retriage(state)
+        self._finish(state.record, "accepted")
+        return LoopResult(record=state.record, output=state.output, exit_code=0)
+
+    def _growth_iterations(self, state: _RunState, first: int) -> str | None:
+        """The Growth Iterations under the lock: the stop rule that ended them, or `None` when
+        an Improvement was accepted; `ra improve` goes on to the next finding instead."""
         if not self._repo.is_clean():
             raise _StopError(DIRTY_TREE)
         with self._lock(state.record.run_id):
@@ -601,8 +765,11 @@ class LoopRunner:
             try:
                 while (rule := self._stop_rule(state, number)) is None:
                     if self._iteration(state, number, self._growth_act_of(state)):
-                        self._finish(state.record, "accepted")
-                        return LoopResult(record=state.record, output=state.output, exit_code=0)
+                        self._remember_improvement(state)
+                        if state.command != "improve":
+                            return None
+                        self._address_finding(state)
+                        state.findings = self._sense(state.budget_usd)
                     number += 1
             except Exception:
                 # A stop rule, a refusal, or a crash inside an Iteration leaves whatever the
@@ -610,7 +777,21 @@ class LoopRunner:
                 # so going back to HEAD destroys nothing the human owns (ADR 0002).
                 self._repo.reset_hard_clean()
                 raise
-            return self._stopped(state, rule)
+            return rule
+
+    def _remember_improvement(self, state: _RunState) -> None:
+        """What the run just added, by title and commit, for the outcome that reports it."""
+        accepted = state.record.iterations[-1]
+        title = state.plan.title if state.plan is not None else ""
+        state.added = f"{title} (commit {accepted.commit_sha})"
+
+    def _address_finding(self, state: _RunState) -> None:
+        """Learn, in `ra improve`: the finding the Improvement addressed is named on the saved
+        record, so the next Sense leaves it out and the next Iteration takes the new top one."""
+        if state.finding is not None:
+            state.record.findings_addressed.append(state.finding.id)
+            self._runs.save(state.record)
+            state.finding = None
 
     @contextmanager
     def _lock(self, run_id: str) -> Iterator[None]:
@@ -776,10 +957,10 @@ class LoopRunner:
             text += "\n"
         path.write_text(text + indented, encoding="utf-8")
 
-    def _task(self, state: _RunState) -> LoopResult:
+    def _task(self, state: _RunState, first: int) -> LoopResult:
         """Task Loop: the Planner states the Definition of Done and the Actor works against it;
         a Capability Gap the human approves turns the rest of the run into a Growth Loop."""
-        number = 1
+        number = first
         try:
             while (rule := self._stop_rule(state, number)) is None:
                 if self._iteration(state, number, self._task_act_of(state)):
@@ -789,6 +970,8 @@ class LoopRunner:
         except _EscalatedError:
             state.judge_reason = None
             return self._growth(state, first=len(state.record.iterations) + 1)
+        except _GrowthTwiceError as twice:
+            return self._growth_twice(state, twice.gaps)
         return self._stopped(state, rule)
 
     def _iteration(
@@ -805,6 +988,9 @@ class LoopRunner:
             raise
         except _EscalatedError:
             self._record_unfinished(state, number, started_at, "rejected", "escalated to growth")
+            raise
+        except _GrowthTwiceError:
+            self._record_unfinished(state, number, started_at, "rejected", GROWTH_NEEDED_TWICE)
             raise
         except Exception as error:
             self._record_unfinished(state, number, started_at, "error", str(error))
@@ -1088,12 +1274,18 @@ class LoopRunner:
         state.planner_reason = reason
 
     def _plan(self, state: _RunState, number: int) -> Plan:
-        """Decide: the Planner turns the Task and the findings into a Definition of Done."""
+        """Decide: the Planner turns its subject and the findings into a Definition of Done.
+
+        In `ra improve` without a goal the subject is the top Sensor Finding, which the run
+        names as addressed once the Improvement is accepted.
+        """
+        if state.record.task is None and state.goal is None:
+            state.finding = state.findings[0]
         result = self._call(
             state,
             "planner",
-            _planner_prompt(
-                state.record.task or "",
+            _decide_prompt(
+                _plan_subject(state.record.task, state.goal, state.finding),
                 state.findings,
                 state.planner_reason or state.judge_reason,
             ),
@@ -1235,8 +1427,13 @@ class LoopRunner:
         )
 
     def _escalate(self, state: _RunState, gaps: Sequence[CapabilityGap]) -> NoReturn:
-        """The Task needs a capability the Organism lacks, so the run becomes a Growth Loop."""
+        """The Task needs a capability the Organism lacks, so the run becomes a Growth Loop;
+        a run that has grown once already stops instead of asking for a second one."""
         state.record.mode = Mode.GROWTH
+        if state.retriaged:
+            for gap in gaps:
+                self._record_gap(state, gap)
+            raise _GrowthTwiceError(gaps)
         self._approve(
             state,
             yaml.safe_dump(
@@ -1260,17 +1457,26 @@ class LoopRunner:
             return "budget"
         if state.no_progress >= self._settings.ra_no_progress_iterations:
             return "no progress"
+        if state.command == "improve" and state.goal is None and not state.findings:
+            return NO_OPEN_FINDINGS
         return None
 
     def _stopped(self, state: _RunState, rule: str) -> LoopResult:
-        """The run hit a stop rule: best effort when there is an Answer, aborted otherwise.
+        """The run hit a stop rule: best effort when there is an Answer, accepted when
+        `ra improve` made an Improvement, aborted otherwise.
 
         Only an Answer comes back as best effort: a Task Loop's output is judged against the
         Target Cases the human approved, so an output that never passed them is not a result.
+        An improve run has no output; its Improvements are commits, so one is enough to accept
+        it when a limit ended the run, and the reason names that limit. A refused approval or
+        an open breaker aborts it all the same, since neither is a limit the run reached.
         """
         answered = state.record.mode is Mode.ANSWER and state.output is not None
         if rule in BEST_EFFORT_RULES and answered:
             return self._best_effort(state, rule)
+        if state.command == "improve" and state.added is not None and rule in IMPROVE_LIMIT_RULES:
+            self._finish(state.record, "accepted")
+            return LoopResult(record=state.record, reason=rule, exit_code=0)
         self._finish(state.record, "aborted")
         return LoopResult(record=state.record, output=state.output, reason=rule, exit_code=2)
 

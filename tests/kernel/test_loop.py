@@ -8,6 +8,7 @@ scripted coders write real files through `on_call`, so the diff, the red check, 
 have something to see. Nothing reaches a model, the network, or the real checkout.
 """
 
+import itertools
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -24,7 +25,12 @@ from pydantic_ai.usage import RequestUsage
 from recursive_application.kernel.breaker import BreakerStore
 from recursive_application.kernel.bundle import frontier_dir
 from recursive_application.kernel.checks import RedResult
-from recursive_application.kernel.evals import CaseResult, EvalReport, ReportStore
+from recursive_application.kernel.evals import (
+    CaseResult,
+    EvalReport,
+    ReportStore,
+    validate_frontier,
+)
 from recursive_application.kernel.git import Repo
 from recursive_application.kernel.loop import (
     ANSWER_RUBRIC,
@@ -55,6 +61,7 @@ from recursive_application.kernel.records import (
     Reflection,
     Review,
     RunStore,
+    SensorFinding,
     TriageDecision,
     WorkerOutput,
 )
@@ -261,7 +268,7 @@ def _harness(
     script: Mapping[str, Sequence[Any]],
     *,
     passes: bool | Sequence[bool] = True,
-    approves: bool = True,
+    approves: bool | Sequence[bool] = True,
     settings: Settings | None = None,
     breakers: BreakerStore | None = None,
     clock: Clock | None = None,
@@ -286,6 +293,7 @@ def _harness(
     harness_approvals: list[str] = []
     harness_red_files: list[list[str]] = []
     verdicts = [passes] if isinstance(passes, bool) else list(passes)
+    decisions = [approves] if isinstance(approves, bool) else list(approves)
 
     def run_evals(request: EvalRequest) -> EvalReport:
         harness_events.append("evals")
@@ -309,7 +317,7 @@ def _harness(
     def approve(text: str) -> bool:
         harness_events.append("approve")
         harness_approvals.append(text)
-        return approves
+        return decisions[min(len(harness_approvals), len(decisions)) - 1]
 
     def configure_tracing(run_id: str) -> Path:
         path = ra_dir / TRACES_DIRNAME / f"{run_id}.jsonl"
@@ -1563,8 +1571,10 @@ def test_a_task_loop_that_escalates_runs_the_growth_loop_it_asked_for(checkout: 
         checkout,
         {
             **GROWTH_SCRIPT,
-            "triage": [TRIAGE_TASK],
-            "planner": [PLAN_WITH_GAP, GROWTH_PLAN],
+            "triage": [TRIAGE_TASK, TRIAGE_TASK],
+            "planner": [PLAN_WITH_GAP, GROWTH_PLAN, TASK_PLAN],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT, REVIEW_ACCEPT],
         },
         checks=CHECKS_PASSED,
         on_call=_coder_effects(checkout),
@@ -1572,10 +1582,16 @@ def test_a_task_loop_that_escalates_runs_the_growth_loop_it_asked_for(checkout: 
 
     result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
 
-    assert result.record.mode is Mode.GROWTH
+    assert [iteration.outcome for iteration in result.record.iterations] == [
+        "rejected",
+        "accepted",
+        "accepted",
+    ]
+    assert result.record.iterations[1].commit_sha is not None
+    assert harness.models.calls_for("planner") == 3
+    assert harness.models.calls_for("triage") == 2
+    assert result.record.mode is Mode.TASK
     assert result.record.outcome == "accepted"
-    assert result.record.iterations[-1].commit_sha is not None
-    assert harness.models.calls_for("planner") == 2
 
 
 NOT_RED = RedResult(red=False, exit_code=0, output="1 passed")
@@ -2274,3 +2290,453 @@ def test_an_answer_gate_compares_against_the_report_that_was_latest_before_its_o
 
     assert result.record.outcome == "accepted"
     assert result.exit_code == 0
+
+
+def _added_and_missing(sha: str | None) -> str:
+    """What an `ra ask` run that needs Growth twice prints: the Improvement, then the gap."""
+    return (
+        f"Added: Teach the Worker what the Gate is (commit {sha})\n\n"
+        f"Still missing:\n- {TOOL_GAP.description}"
+    )
+
+
+def _recorded_gaps(harness: Harness) -> list[tuple[str, str]]:
+    """The findings the run wrote for the next one, as (id, summary) pairs."""
+    findings = stored_findings(FindingStore(harness.ra_dir / FINDINGS_FILENAME))
+    return [(finding.id, finding.summary) for finding in findings]
+
+
+TRIAGE_GROWTH_FOR_GAP = TriageDecision(
+    mode=Mode.GROWTH,
+    reasoning="The note needs the git history, which no agent can read yet.",
+    reflection=Reflection(required_capabilities=["cite the git history"], gaps=[TOOL_GAP]),
+)
+ONE_REQUEST = RequestUsage(input_tokens=10, output_tokens=1)
+
+
+def test_after_an_improvement_in_ask_triage_runs_again_and_the_task_loop_it_picks_ends_the_run(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            **GROWTH_SCRIPT,
+            "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_TASK],
+            "planner": [GROWTH_PLAN.model_copy(update={"gaps": [HUMAN_GAP]}), TASK_PLAN],
+            "worker": [WORKER_NOTE],
+            "reviewer": [REVIEW_ACCEPT, REVIEW_ACCEPT],
+        },
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        usage=ONE_REQUEST,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert result.exit_code == 0
+    assert result.record.mode is Mode.TASK
+    assert harness.models.calls_for("triage") == 2
+    first_triage, second_triage = harness.models.prompts_for("triage")
+    assert second_triage.startswith(f"Task: {TASK_REQUEST}\n\nOpen Sensor Findings:\n")
+    recorded_gap = f"reflection:{result.record.run_id}:1"
+    assert recorded_gap not in first_triage
+    assert recorded_gap in second_triage
+    first, second = result.record.iterations
+    assert first.commit_sha is not None
+    assert second.number == 2
+    assert second.outcome == "accepted"
+    assert second.output_path == f".ra/{TASKS_DIRNAME}/{result.record.run_id}/output.md"
+    assert result.output == RELEASE_NOTE
+    assert [first.usage.requests, second.usage.requests] == [6, 4]
+    assert "Iteration: 2 of 5" in harness.models.requests["worker"][0].instructions
+    assert not (harness.ra_dir / LOCK_FILENAME).exists()
+    assert Repo(checkout).is_clean()
+
+
+def test_a_second_growth_need_after_the_improvement_stops_the_run_naming_the_added_and_the_missing(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_GROWTH_FOR_GAP]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        usage=ONE_REQUEST,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "rejected"
+    assert result.exit_code == 1
+    assert result.reason == "growth needed twice"
+    first, second = result.record.iterations
+    assert result.output == _added_and_missing(first.commit_sha)
+    assert second.number == 2
+    assert second.outcome == "rejected"
+    assert second.reason == "growth needed twice"
+    assert second.plan is None
+    assert second.usage.requests == 1
+    assert harness.models.calls_for("planner") == 1
+    assert result.record.mode is Mode.GROWTH
+    assert not (harness.ra_dir / LOCK_FILENAME).exists()
+    assert RunStore(harness.ra_dir / RUNS_DIRNAME).load(result.record.run_id).outcome == "rejected"
+    assert _recorded_gaps(harness) == [
+        (f"reflection:{result.record.run_id}:1", TOOL_GAP.description)
+    ]
+
+
+def test_an_escalation_inside_the_continued_task_loop_is_growth_needed_twice_as_well(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            **GROWTH_SCRIPT,
+            "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_TASK],
+            "planner": [GROWTH_PLAN, PLAN_WITH_GAP],
+            "worker": [WORKER_NOTE],
+        },
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        usage=ONE_REQUEST,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions())
+
+    assert result.record.outcome == "rejected"
+    assert result.exit_code == 1
+    assert result.reason == "growth needed twice"
+    first, second = result.record.iterations
+    assert result.output == _added_and_missing(first.commit_sha)
+    assert second.outcome == "rejected"
+    assert second.reason == "growth needed twice"
+    assert second.plan == PLAN_WITH_GAP
+    assert second.usage.requests == 2
+    assert harness.models.calls_for("worker") == 0
+    assert len(harness.approvals) == 1
+    assert harness.approvals[0].startswith("title: Teach the Worker what the Gate is")
+    assert result.record.mode is Mode.GROWTH
+    assert Repo(checkout).is_clean()
+    assert _recorded_gaps(harness) == [
+        (f"reflection:{result.record.run_id}:1", TOOL_GAP.description)
+    ]
+
+
+def test_a_clarification_gap_from_the_second_triage_ends_the_run_with_its_questions(
+    checkout: Path,
+) -> None:
+    clock = Clock()
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_CLARIFICATION]},
+        checks=CHECKS_PASSED,
+        on_call={**_coder_effects(checkout), "librarian": lambda: clock.advance(minutes=1)},
+        usage=ONE_REQUEST,
+        clock=clock,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.questions == ["Which repository do you mean?", "Which branch?"]
+    assert result.reason == "clarification"
+    assert result.exit_code == 2
+    assert result.record.outcome == "aborted"
+    first, second = result.record.iterations
+    assert first.commit_sha is not None
+    assert second.number == 2
+    assert second.outcome == "aborted"
+    assert second.plan is None
+    assert second.usage.requests == 1
+    assert (first.started_at, second.started_at) == (START, START + timedelta(minutes=1))
+    assert harness.models.calls_for("planner") == 1
+
+
+FIRST_FINDING = SensorFinding(
+    id="reflection:20260904-090000-aaaaaa:1",
+    source="reflection",
+    summary="The Worker cannot say what the Gate is",
+    details="kind: knowledge\nhow_to_acquire: Add a glossary entry for the Gate",
+    severity="high",
+)
+SECOND_FINDING = SensorFinding(
+    id="reflection:20260904-100000-bbbbbb:1",
+    source="reflection",
+    summary="The Worker cannot say what a Sensor is",
+    details="kind: knowledge\nhow_to_acquire: Add a glossary entry for the Sensor",
+    severity="high",
+)
+SECOND_GROWTH_PLAN = GROWTH_PLAN.model_copy(update={"title": "Teach the Worker what a Sensor is"})
+IMPROVE_SCRIPT: Mapping[str, Sequence[Any]] = {
+    "planner": [GROWTH_PLAN, SECOND_GROWTH_PLAN],
+    "test_writer": [TEST_REPORT, TEST_REPORT],
+    "implementer": [CODE_REPORT, CODE_REPORT],
+    "reviewer": [REVIEW_ACCEPT, REVIEW_ACCEPT],
+    "librarian": [LIBRARIAN_SUMMARY, LIBRARIAN_SUMMARY],
+}
+
+
+def _seed_findings(checkout: Path, *findings: SensorFinding) -> None:
+    """Store findings dated before the run, the first the oldest, so `high` ones outrank the
+    checkout's frontier findings and drop out once a run names them as addressed."""
+    store = FindingStore(checkout / RA_DIRNAME / FINDINGS_FILENAME)
+    for position, finding in enumerate(findings):
+        store.append(finding, START - timedelta(days=len(findings) - position))
+
+
+def _improving_effects(checkout: Path) -> dict[str, Callable[[], None]]:
+    """Scripted coders whose every Improvement changes the glossary, so each has a diff."""
+    improvements = itertools.count(1)
+
+    def implement() -> None:
+        _write_file(
+            checkout / GLOSSARY_PATH, f"{GLOSSARY_SOURCE}\n\nIMPROVEMENTS = {next(improvements)}\n"
+        )
+
+    return {**_coder_effects(checkout), "implementer": implement}
+
+
+def test_improve_takes_the_top_finding_then_the_next_and_ends_accepted_at_the_iteration_limit(
+    checkout: Path,
+) -> None:
+    _seed_findings(checkout, FIRST_FINDING, SECOND_FINDING)
+    harness = _harness(
+        checkout, IMPROVE_SCRIPT, checks=CHECKS_PASSED, on_call=_improving_effects(checkout)
+    )
+
+    result = harness.runner.run(Mode.GROWTH, None, LoopOptions(yes=True, max_iterations=2))
+
+    assert result.record.outcome == "accepted"
+    assert result.reason == "iteration limit"
+    assert result.exit_code == 0
+    assert [iteration.outcome for iteration in result.record.iterations] == [
+        "accepted",
+        "accepted",
+    ]
+    assert all(iteration.commit_sha is not None for iteration in result.record.iterations)
+    addressed = [FIRST_FINDING.id, SECOND_FINDING.id]
+    assert result.record.findings_addressed == addressed
+    stored = RunStore(harness.ra_dir / RUNS_DIRNAME).load(result.record.run_id)
+    assert stored.findings_addressed == addressed
+    first, second = harness.models.prompts_for("planner")
+    assert first.startswith(
+        f"Finding: {FIRST_FINDING.id}\n{FIRST_FINDING.summary}\n{FIRST_FINDING.details}\n\n"
+        f"Open Sensor Findings:\n"
+        f"- [high] {FIRST_FINDING.id}: {FIRST_FINDING.summary}\n"
+        f"- [high] {SECOND_FINDING.id}: {SECOND_FINDING.summary}\n"
+        f"- [medium] evals:frontier/"
+    )
+    assert second.startswith(
+        f"Finding: {SECOND_FINDING.id}\n{SECOND_FINDING.summary}\n{SECOND_FINDING.details}\n\n"
+        f"Open Sensor Findings:\n"
+        f"- [high] {SECOND_FINDING.id}: {SECOND_FINDING.summary}\n"
+        f"- [medium] evals:frontier/"
+    )
+    assert FIRST_FINDING.id not in second
+    assert harness.models.calls_for("triage") == 0
+    log = Repo(checkout).log(n=5)
+    assert "ra: Teach the Worker what the Gate is" in log
+    assert "ra: Teach the Worker what a Sensor is" in log
+    assert Repo(checkout).is_clean()
+
+
+def test_improve_with_a_goal_hands_the_planner_the_goal_and_the_findings_and_singles_out_none(
+    checkout: Path,
+) -> None:
+    _seed_findings(checkout, FIRST_FINDING)
+    harness = _harness(
+        checkout, GROWTH_SCRIPT, checks=CHECKS_PASSED, on_call=_coder_effects(checkout)
+    )
+
+    result = harness.runner.run(
+        Mode.GROWTH, None, LoopOptions(yes=True, max_iterations=1, goal="reduce cost")
+    )
+
+    prompt = harness.models.prompts_for("planner")[0]
+    assert prompt.startswith(
+        "Goal: reduce cost\n\nOpen Sensor Findings:\n"
+        f"- [high] {FIRST_FINDING.id}: {FIRST_FINDING.summary}\n"
+        "- [medium] evals:frontier/"
+    )
+    assert "Finding:" not in prompt
+    assert result.record.findings_addressed == []
+    assert result.record.outcome == "accepted"
+    assert result.reason == "iteration limit"
+    assert result.exit_code == 0
+    assert [iteration.commit_sha is not None for iteration in result.record.iterations] == [True]
+
+
+def _seed_green_frontier(checkout: Path) -> None:
+    """Persist a latest report in which every Frontier Case passes, so Sense has no eval finding."""
+    _seed_latest_report(
+        checkout,
+        *(
+            CaseResult(dataset=f"frontier/{path.stem}", name=case.name, passed=True)
+            for path in sorted(frontier_dir(checkout).glob("*.yaml"))
+            for case in validate_frontier(path)
+        ),
+    )
+
+
+def test_improve_ends_accepted_with_no_open_findings_once_the_last_finding_is_addressed(
+    checkout: Path,
+) -> None:
+    _seed_green_frontier(checkout)
+    _seed_findings(checkout, FIRST_FINDING)
+    harness = _harness(
+        checkout, GROWTH_SCRIPT, checks=CHECKS_PASSED, on_call=_coder_effects(checkout)
+    )
+
+    result = harness.runner.run(Mode.GROWTH, None, LoopOptions(yes=True))
+
+    assert result.record.outcome == "accepted"
+    assert result.reason == "no open findings"
+    assert result.exit_code == 0
+    assert [iteration.outcome for iteration in result.record.iterations] == ["accepted"]
+    assert result.record.findings_addressed == [FIRST_FINDING.id]
+    assert harness.models.calls_for("planner") == 1
+    assert not (harness.ra_dir / LOCK_FILENAME).exists()
+
+
+def test_improve_with_nothing_open_before_its_first_iteration_is_aborted_as_no_open_findings(
+    checkout: Path,
+) -> None:
+    _seed_green_frontier(checkout)
+    harness = _harness(checkout, GROWTH_SCRIPT, checks=CHECKS_PASSED)
+
+    result = harness.runner.run(Mode.GROWTH, None, LoopOptions(yes=True))
+
+    assert result.record.outcome == "aborted"
+    assert result.reason == "no open findings"
+    assert result.exit_code == 2
+    assert result.record.iterations == []
+    assert harness.models.calls_for("planner") == 0
+    assert not (harness.ra_dir / LOCK_FILENAME).exists()
+
+
+def test_an_improve_run_that_accepted_no_improvement_is_aborted_at_the_iteration_limit(
+    checkout: Path,
+) -> None:
+    _seed_findings(checkout, FIRST_FINDING)
+    harness = _harness(
+        checkout,
+        REJECTED_SCRIPT,
+        checks=CHECKS_TY_FAILED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, None, LoopOptions(yes=True))
+
+    assert result.record.outcome == "aborted"
+    assert result.reason == "iteration limit"
+    assert result.exit_code == 2
+    assert [iteration.outcome for iteration in result.record.iterations] == ["rejected"]
+    assert result.record.findings_addressed == []
+    assert harness.models.prompts_for("planner")[0].startswith(f"Finding: {FIRST_FINDING.id}\n")
+
+
+def test_an_improvement_at_the_iteration_limit_ends_the_ask_run_before_a_second_triage(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_TASK]},
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=1),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "aborted"
+    assert result.reason == "iteration limit"
+    assert result.exit_code == 2
+    assert harness.models.calls_for("triage") == 1
+    assert [iteration.outcome for iteration in result.record.iterations] == ["accepted"]
+    assert result.record.iterations[0].commit_sha is not None
+    assert result.output is None
+
+
+def test_an_improvement_that_spends_the_wall_time_ends_the_ask_run_before_a_second_triage(
+    checkout: Path,
+) -> None:
+    clock = Clock()
+    harness = _harness(
+        checkout,
+        {**GROWTH_SCRIPT, "triage": [TRIAGE_GROWTH_FOR_GAP, TRIAGE_TASK]},
+        checks=CHECKS_PASSED,
+        on_call={**_coder_effects(checkout), "librarian": lambda: clock.advance(minutes=31)},
+        clock=clock,
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert result.record.outcome == "aborted"
+    assert result.reason == "wall time"
+    assert harness.models.calls_for("triage") == 1
+    assert result.record.iterations[0].commit_sha is not None
+
+
+def test_a_task_draft_from_before_the_improvement_is_not_the_output_of_a_stopped_ask_run(
+    checkout: Path,
+) -> None:
+    harness = _harness(
+        checkout,
+        {
+            **GROWTH_SCRIPT,
+            "triage": [TRIAGE_TASK],
+            "planner": [TASK_PLAN, GROWTH_PLAN],
+            "worker": [WORKER_OUTPUT_WITH_GAP],
+        },
+        checks=CHECKS_PASSED,
+        on_call=_coder_effects(checkout),
+        settings=_settings(ra_max_iterations=2),
+    )
+
+    result = harness.runner.run(None, TASK_REQUEST, LoopOptions(yes=True))
+
+    assert [iteration.outcome for iteration in result.record.iterations] == [
+        "rejected",
+        "accepted",
+    ]
+    assert result.record.outcome == "aborted"
+    assert result.reason == "iteration limit"
+    assert result.output is None
+    assert harness.models.calls_for("triage") == 1
+
+
+def test_an_improve_run_whose_second_plan_is_refused_is_aborted_with_its_improvement_standing(
+    checkout: Path,
+) -> None:
+    _seed_findings(checkout, FIRST_FINDING, SECOND_FINDING)
+    harness = _harness(
+        checkout,
+        {
+            "planner": [
+                GROWTH_PLAN,
+                GROWTH_PLAN.model_copy(update={"title": "Teach the Worker what a Sensor is"}),
+            ],
+            "test_writer": [TEST_REPORT] * 2,
+            "implementer": [CODE_REPORT] * 2,
+            "reviewer": [REVIEW_ACCEPT] * 2,
+            "librarian": [LIBRARIAN_SUMMARY] * 2,
+        },
+        checks=CHECKS_PASSED,
+        on_call=_improving_effects(checkout),
+        approves=[True, False],
+        settings=_settings(ra_max_iterations=3),
+    )
+
+    result = harness.runner.run(Mode.GROWTH, None, LoopOptions())
+
+    assert result.record.outcome == "aborted"
+    assert result.reason == "approval refused"
+    assert result.exit_code == 2
+    assert [iteration.outcome for iteration in result.record.iterations] == [
+        "accepted",
+        "aborted",
+    ]
+    assert result.record.iterations[0].commit_sha is not None
+    assert result.record.findings_addressed == [FIRST_FINDING.id]
+    assert Repo(checkout).is_clean()
