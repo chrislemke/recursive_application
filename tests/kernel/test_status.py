@@ -1,13 +1,17 @@
 """The status report and the Wiki commands, through `kernel.status`.
 
 The three functions the CLI calls: `render_status` is deterministic over a runtime directory,
-a Wiki, the frontier ladders, and a breaker store; `ingest_wiki` runs the Librarian under a
-test model, so no tool ever reaches the checkout; `lint_wiki` reads the Wiki's lint report.
+a Wiki, the frontier ladders, a breaker store, and Settings whose Sign-in, when a tier names
+one, lives under `tmp_path`; `ingest_wiki` runs the Librarian under a test model, so no tool
+ever reaches the checkout; `lint_wiki` reads the Wiki's lint report.
 """
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic_ai.models.test import TestModel
@@ -36,6 +40,7 @@ SUMMARY = "Recorded the document."
 """What the Librarian's test model answers with, whatever it is handed."""
 
 HEADINGS = (
+    "## Providers",
     "## Breakers",
     "## Open Sensor Findings",
     "## Recent runs",
@@ -44,6 +49,45 @@ HEADINGS = (
     "## Frontier",
     "## Frontier proposals",
 )
+
+
+ACCOUNT_ID = "acct_test_0001"
+EXP = 1_788_775_200
+"""The access token's `exp`, which is 2026-09-07T10:00:00Z."""
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _jwt(payload: dict[str, Any]) -> str:
+    """A fake JWT: base64url header and payload with a signature nobody verifies."""
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    return f"{header}.{_b64url(json.dumps(payload).encode())}.fake-signature"
+
+
+ACCESS_TOKEN = _jwt({"exp": EXP, "sub": "user_0001"})
+
+
+def _write_sign_in(
+    codex_home: Path, *, access_token: str = ACCESS_TOKEN, plan_type: str | None = "plus"
+) -> None:
+    """A Sign-in file in the Codex CLI's `auth.json` schema, under `codex_home`."""
+    claim: dict[str, Any] = {"chatgpt_account_id": ACCOUNT_ID}
+    if plan_type is not None:
+        claim["chatgpt_plan_type"] = plan_type
+    document = {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": _jwt({"https://api.openai.com/auth": claim}),
+            "access_token": access_token,
+            "refresh_token": "rt_fake_refresh_token_0001",
+            "account_id": ACCOUNT_ID,
+        },
+        "last_refresh": "2026-09-06T08:00:00Z",
+    }
+    (codex_home / "auth.json").write_text(json.dumps(document, indent=2))
 
 
 def _section(text: str, heading: str) -> str:
@@ -69,6 +113,7 @@ def test_status_on_an_empty_runtime_directory_prints_every_section(tmp_path: Pat
         frontier_dir=FRONTIER_DIR,
         budget_usd=Decimal("5"),
         breakers=BreakerStore(tmp_path / "breakers.json"),
+        settings=Settings(_env_file=None),
     )
 
     positions = [text.index(heading) for heading in HEADINGS]
@@ -86,6 +131,108 @@ def test_status_on_an_empty_runtime_directory_prints_every_section(tmp_path: Pat
     assert "- text-analysis: 0/5, next rung 1" in frontier
     assert "- web-research: 0/3, next rung 1" in frontier
     assert "(none)" in _section(text, "## Frontier proposals")
+
+
+def _status(tmp_path: Path, settings: Settings) -> str:
+    """The report over an empty runtime directory, a fresh Wiki, and `settings`."""
+    return render_status(
+        ra_dir=ensure_ra_dirs(tmp_path),
+        wiki=_wiki(tmp_path),
+        frontier_dir=FRONTIER_DIR,
+        budget_usd=Decimal("5"),
+        breakers=BreakerStore(tmp_path / "breakers.json"),
+        settings=settings,
+    )
+
+
+def test_status_opens_with_the_providers_and_says_the_openrouter_key_is_missing(
+    tmp_path: Path,
+) -> None:
+    text = _status(tmp_path, Settings(_env_file=None))
+
+    assert text.startswith("## Providers\n")
+    providers = _section(text, "## Providers")
+    assert "- primary: openrouter:anthropic/claude-sonnet-5\n" in providers
+    assert "- judge: openrouter:openai/gpt-5.4-mini\n" in providers
+    assert "- OPENROUTER_API_KEY: missing\n" in providers
+
+
+def test_status_reports_a_valid_chatgpt_sign_in_with_its_plan_and_the_served_models(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    _write_sign_in(codex_home)
+    cache = {
+        "models": [
+            {"slug": "gpt-6-astra", "display_name": "GPT-6 Astra", "priority": 1},
+            {"slug": "gpt-5.5", "display_name": "GPT-5.5", "priority": 12},
+        ]
+    }
+    (codex_home / "models_cache.json").write_text(json.dumps(cache))
+    settings = Settings(
+        _env_file=None, ra_judge_model="chatgpt:gpt-5.4-mini", codex_home=codex_home
+    )
+
+    providers = _section(_status(tmp_path, settings), "## Providers")
+
+    assert "- judge: chatgpt:gpt-5.4-mini\n" in providers
+    assert "- OPENROUTER_API_KEY: missing\n" in providers
+    assert "- ChatGPT sign-in: valid until 2026-09-07T10:00:00Z (plan plus)\n" in providers
+    assert "- ChatGPT models: gpt-6-astra, gpt-5.5\n" in providers
+    assert ACCESS_TOKEN not in providers
+
+
+def test_status_says_not_signed_in_when_the_chatgpt_sign_in_is_missing(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    settings = Settings(
+        _env_file=None, ra_judge_model="chatgpt:gpt-5.4-mini", codex_home=codex_home
+    )
+
+    providers = _section(_status(tmp_path, settings), "## Providers")
+
+    assert "- ChatGPT sign-in: not signed in (run codex login)\n" in providers
+    assert "ChatGPT models" not in providers
+
+
+def test_status_omits_the_plan_when_the_sign_in_names_none(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    _write_sign_in(codex_home, plan_type=None)
+    settings = Settings(_env_file=None, ra_model="chatgpt:gpt-5.5", codex_home=codex_home)
+
+    providers = _section(_status(tmp_path, settings), "## Providers")
+
+    assert "- ChatGPT sign-in: valid until 2026-09-07T10:00:00Z\n" in providers
+
+
+def test_status_calls_a_token_without_exp_valid_with_no_expiry_claim(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    _write_sign_in(codex_home, access_token=_jwt({"sub": "user_0001"}))
+    settings = Settings(_env_file=None, ra_model="chatgpt:gpt-5.5", codex_home=codex_home)
+
+    providers = _section(_status(tmp_path, settings), "## Providers")
+
+    assert "- ChatGPT sign-in: valid, no expiry claim (plan plus)\n" in providers
+
+
+def test_status_reports_a_set_openai_key_without_its_value(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        ra_model="openai:gpt-5.4",
+        openai_api_key="sk-test",
+        openrouter_api_key="sk-or-test",
+    )
+
+    text = _status(tmp_path, settings)
+
+    providers = _section(text, "## Providers")
+    assert "- OPENAI_API_KEY: set\n" in providers
+    assert "- OPENROUTER_API_KEY: set\n" in providers
+    assert "sk-test" not in text
+    assert "sk-or-test" not in text
 
 
 def _boom() -> None:
@@ -145,6 +292,7 @@ def test_status_on_a_seeded_runtime_directory_shows_what_the_operator_needs(
         frontier_dir=FRONTIER_DIR,
         budget_usd=Decimal("5"),
         breakers=breakers,
+        settings=Settings(_env_file=None),
     )
 
     assert "- planner: open" in _section(text, "## Breakers")

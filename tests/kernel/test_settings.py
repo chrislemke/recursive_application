@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from recursive_application.kernel.settings import Settings, SettingsError, load_settings
+from recursive_application.kernel.settings import Settings, load_settings
 
 
 def test_with_no_file_and_no_variables_the_defaults_are_the_spec_literals() -> None:
@@ -31,20 +31,6 @@ def test_with_no_file_and_no_variables_the_defaults_are_the_spec_literals() -> N
     assert settings.openai_api_key == ""
     assert settings.codex_home == Path.home() / ".codex"
     assert settings.ra_chatgpt_originator == "recursive_application"
-
-
-def test_require_api_key_raises_the_settings_error_naming_the_variable_for_a_blank_key() -> None:
-    settings = Settings(_env_file=None)
-
-    with pytest.raises(SettingsError, match="OPENROUTER_API_KEY"):
-        settings.require_api_key()
-
-
-def test_require_api_key_passes_for_a_set_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-    settings = Settings(_env_file=None)
-
-    settings.require_api_key()
 
 
 def test_an_environment_variable_wins_over_the_file_for_the_same_key(

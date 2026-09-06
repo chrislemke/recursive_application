@@ -30,6 +30,16 @@ The Loop's limits are settings too, each optional. Their defaults live in `src/r
 
 Check the install with `uv run ra --help`. The Gate runs the four checks named in `docs/coding-guide.md` on every diff that changes code, before any eval runs.
 
+## Providers
+
+There are three ways to pay for model calls. An OpenRouter key: set `OPENROUTER_API_KEY`. This is the default. An OpenAI key: set `OPENAI_API_KEY`. A ChatGPT subscription: install the Codex CLI, run `codex login` once, and the Kernel reads the Sign-in it writes. The factory and the credential check are `src/recursive_application/kernel/providers.py`; the Sign-in reader and the backend adapter are `src/recursive_application/kernel/chatgpt.py`.
+
+A model name is `<scheme>:<model>`. `RA_MODEL` names the primary model and `RA_JUDGE_MODEL` the Judge Model, and each may use a different Provider. `openrouter:<vendor>/<model>` calls through OpenRouter. `openai:<model>` calls OpenAI with the key. `chatgpt:<model>` calls the ChatGPT backend with the Sign-in; `.env.example` shows `gpt-5.5`. Before any command but `ra status` runs, the Kernel checks that each tier's key is set or its Sign-in loads, and exits 2 naming the variable or `codex login` otherwise. A model name pydantic-ai does not know also exits 2.
+
+The Sign-in is the Codex CLI's `auth.json` under `CODEX_HOME`, by default the `.codex` directory in your home. The Kernel reads it before every request and never writes or refreshes it; when it has expired, run `codex login` again. A run is refused before it starts when the token would expire before `RA_MAX_MINUTES` ends. `ra status` reports whether the Sign-in loads and when its token expires, and lists the models the Codex CLI last saw the backend serve, so you can name a `chatgpt:` model that exists. The Kernel names itself to the backend as `recursive_application` in the `originator` header; `RA_CHATGPT_ORIGINATOR` changes that. A subscription run reports cost at the OpenAI list price for model ids the price data knows and 0 for the others, so for those the token limit is the budget rule.
+
+OpenAI's Codex documentation neither permits nor forbids using the Sign-in outside Codex, and it calls API keys the right way to authenticate automation. Running on the subscription is your own risk. See `docs/adr/0011-model-access-is-a-kernel-seam-and-the-chatgpt-subscription-is-an-adapter.md`.
+
 ## Commands
 
 `ra` has six commands. `ra <command> --help` prints the flags. The source is `src/recursive_application/kernel/cli.py`.
@@ -55,7 +65,7 @@ Stop rules apply to every run: the iteration limit, the wall time, the budget, `
 | --- | --- |
 | `0` | accepted |
 | `1` | rejected or best effort; also `ra wiki lint` finding a page to fix |
-| `2` | aborted or usage error: a clarification, a stop rule, a dirty tree, a held lock, a refused approval, a missing setting, a bad dataset name or path |
+| `2` | aborted or usage error: a clarification, a stop rule, a dirty tree, a held lock, a refused approval, a missing setting, key, or Sign-in, a bad dataset name or path |
 | `3` | internal error |
 
 ## Kernel and Organism
@@ -82,7 +92,7 @@ Everything a run writes goes under `.ra` at the repo root. It is gitignored, the
 
 The lock is a plain file holding the run id. A run killed with `kill -9` leaves it behind, and the next `ra improve` then exits 2 with "lock held" until you delete it.
 
-`ra status` reads all of this and prints seven sections, from the breakers to the Librarian's frontier proposals; `src/recursive_application/kernel/status.py` lists them.
+`ra status` reads all of this and prints eight sections, from the Providers and their credentials to the Librarian's frontier proposals; `src/recursive_application/kernel/status.py` lists them.
 
 Tracked state is git. Each accepted Improvement is one commit made by the Kernel, authored as `ra Kernel <ra@localhost>`, with a message beginning `ra:`. The system never pushes. Git tracks the Wiki (`wiki/`) and the eval datasets (`evals/`) because they are the system's knowledge and its specification. See `docs/adr/0002-git-as-state-store.md`.
 

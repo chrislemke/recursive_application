@@ -1,8 +1,9 @@
 """Kernel Settings: the provider keys, the Sign-in directory, the models, and the Loop's limits.
 
 Values come from environment variables (upper-cased field names) and, below them in
-precedence, the `.env` file at `REPO_ROOT`; `.env.example` documents them. The keys are
-never printed or logged.
+precedence, the `.env` file at `REPO_ROOT`. `.env.example` documents the keys, the Sign-in
+directory, and the models; `README.md` lists the Loop's limits. The keys are never printed or
+logged.
 """
 
 import os
@@ -71,13 +72,6 @@ class Settings(BaseSettings):
     def _expand_home(cls, value: Path) -> Path:
         """Expand a leading `~`, which pydantic-settings leaves literal in a field value."""
         return value.expanduser()
-
-    def require_api_key(self) -> None:
-        """Raise `SettingsError` naming `OPENROUTER_API_KEY` when the key is blank."""
-        if not self.openrouter_api_key:
-            raise SettingsError(
-                f"{API_KEY_VARIABLE} is not set; put it in {ENV_FILENAME} or the environment"
-            )
 
 
 def load_settings(env_file: Path | None = None) -> Settings:

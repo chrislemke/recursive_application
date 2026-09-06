@@ -6,7 +6,11 @@ file lives under `tmp_path`, never the real `~/.codex`, so every `chatgpt` case 
 makes no network call.
 """
 
+import base64
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic_ai.models.openai import OpenAIResponsesModel
@@ -20,6 +24,42 @@ from recursive_application.kernel.providers import (
     sign_in_path,
 )
 from recursive_application.kernel.settings import Settings
+
+ACCOUNT_ID = "acct_test_0001"
+EXP = 1_788_775_200
+"""The access token's `exp`, which is 2026-09-07T10:00:00Z."""
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _jwt(payload: dict[str, Any]) -> str:
+    """A fake JWT: base64url header and payload with a signature nobody verifies."""
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    return f"{header}.{_b64url(json.dumps(payload).encode())}.fake-signature"
+
+
+ID_TOKEN = _jwt(
+    {"https://api.openai.com/auth": {"chatgpt_account_id": ACCOUNT_ID, "chatgpt_plan_type": "plus"}}
+)
+ACCESS_TOKEN = _jwt({"exp": EXP, "sub": "user_0001"})
+
+
+def _write_sign_in(codex_home: Path) -> None:
+    """A Sign-in file in the Codex CLI's `auth.json` schema, under `codex_home`."""
+    document = {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": ID_TOKEN,
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": "rt_fake_refresh_token_0001",
+            "account_id": ACCOUNT_ID,
+        },
+        "last_refresh": "2026-09-06T08:00:00Z",
+    }
+    (codex_home / "auth.json").write_text(json.dumps(document, indent=2))
 
 
 @pytest.mark.parametrize(
@@ -76,20 +116,24 @@ def test_a_chatgpt_judge_without_a_sign_in_is_refused_naming_the_file_and_codex_
         codex_home=tmp_path,
     )
 
-    with pytest.raises(ProviderError, match=r"auth\.json(?s:.*)codex login"):
+    with pytest.raises(ProviderError, match=r"auth\.json(?s:.*)codex login(?s:.*)CODEX_HOME"):
         require_credentials(settings)
 
 
-def test_a_chatgpt_judge_passes_once_the_sign_in_file_exists(tmp_path: Path) -> None:
-    (tmp_path / "auth.json").write_text("{}")
+def test_a_chatgpt_judge_passes_with_a_sign_in_whose_token_outlives_the_run(
+    tmp_path: Path,
+) -> None:
+    _write_sign_in(tmp_path)
     settings = Settings(
         _env_file=None,
         ra_judge_model="chatgpt:gpt-5.4-mini",
         openrouter_api_key="sk-or-test",
         codex_home=tmp_path,
+        ra_max_minutes=30,
     )
+    two_hours_before_expiry = datetime(2026, 9, 7, 8, 0, tzinfo=UTC)
 
-    require_credentials(settings)
+    require_credentials(settings, clock=lambda: two_hours_before_expiry)
 
 
 def test_a_scheme_the_kernel_does_not_key_is_not_checked_here() -> None:
@@ -132,3 +176,31 @@ def test_two_calls_of_the_factory_give_two_objects() -> None:
     build = model_factory(Settings(_env_file=None))
 
     assert build("test") is not build("test")
+
+
+def test_the_factory_builds_a_chatgpt_model_from_its_name_over_the_sign_in(
+    tmp_path: Path,
+) -> None:
+    _write_sign_in(tmp_path)
+
+    model = model_factory(Settings(_env_file=None, codex_home=tmp_path))("chatgpt:gpt-5.5")
+
+    assert model.model_name == "gpt-5.5"
+    assert model.system == "openai"
+
+
+def test_a_chatgpt_judge_whose_token_expires_within_the_run_is_refused_naming_the_expiry(
+    tmp_path: Path,
+) -> None:
+    _write_sign_in(tmp_path)
+    settings = Settings(
+        _env_file=None,
+        ra_judge_model="chatgpt:gpt-5.4-mini",
+        openrouter_api_key="sk-or-test",
+        codex_home=tmp_path,
+        ra_max_minutes=30,
+    )
+    ten_minutes_before_expiry = datetime(2026, 9, 7, 9, 50, tzinfo=UTC)
+
+    with pytest.raises(ProviderError, match=r"2026-09-07T10:00:00Z(?s:.*)codex login"):
+        require_credentials(settings, clock=lambda: ten_minutes_before_expiry)

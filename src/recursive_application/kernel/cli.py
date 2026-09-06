@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.models import Model
 
 from recursive_application.kernel.breaker import BreakerStore
 from recursive_application.kernel.checks import run_checks, run_red_check
@@ -46,6 +48,7 @@ from recursive_application.kernel.paths import (
     ensure_ra_dirs,
 )
 from recursive_application.kernel.policy import PolicyError
+from recursive_application.kernel.providers import model_factory, require_credentials
 from recursive_application.kernel.records import Mode, RunRecord
 from recursive_application.kernel.registry import Registry, RegistryError, load_registry
 from recursive_application.kernel.runtime import AgentRunner
@@ -67,8 +70,10 @@ USAGE_ERRORS: tuple[type[Exception], ...] = (
     PolicyError,
     RegistryError,
     FileNotFoundError,
+    UserError,
 )
-"""What the Operator can fix: a bad name, a missing Setting, a refused configuration, a path."""
+"""What the Operator can fix: a bad name, a missing Setting, a refused configuration, a path, a
+model name or key pydantic-ai refuses itself."""
 
 BREAKER_FILENAME = "breaker.json"
 """Where the breaker states live under the runtime directory."""
@@ -106,6 +111,7 @@ class KernelContext:
     breakers: BreakerStore
     agents: AgentRunner
     runners: Runners
+    model_factory: Callable[[str], Model]
 
 
 def _eval_context(
@@ -138,16 +144,19 @@ def _approve(text: str) -> bool:
     return typer.confirm("Approve?")
 
 
-def build_context() -> KernelContext:
+def build_context(*, check_credentials: bool = True) -> KernelContext:
     """Build the Kernel's collaborators for one command: Settings, registry, git, Wiki, runners.
 
-    The Organism's Wiki is imported here and not at module level, so the Kernel still imports
-    nothing from the Organism when it is loaded; the same rule `load_registry` follows.
+    Every command refuses to start without the credentials its two tiers need, except `status`,
+    whose Providers section explains a missing key or Sign-in instead. The Organism's Wiki is
+    imported here and not at module level, so the Kernel still imports nothing from the
+    Organism when it is loaded; the same rule `load_registry` follows.
     """
     from recursive_application.organism.wiki import Wiki
 
     settings = load_settings()
-    settings.require_api_key()
+    if check_credentials:
+        require_credentials(settings)
     root = REPO_ROOT
     ra_dir = ensure_ra_dirs(root)
     registry = load_registry(root)
@@ -158,7 +167,8 @@ def build_context() -> KernelContext:
         failure_threshold=settings.ra_breaker_failures,
         reset_timeout_s=settings.ra_breaker_reset_s,
     )
-    agents = AgentRunner(settings, breakers, root=root)
+    factory = model_factory(settings)
+    agents = AgentRunner(settings, breakers, root=root, model_factory=factory)
 
     def evals(request: EvalRequest) -> EvalReport:
         return evaluate_request(
@@ -173,7 +183,7 @@ def build_context() -> KernelContext:
                 run_id=request.run_id,
             ),
             reports_dir=ra_dir / EVALS_DIRNAME,
-            judge_model=settings.ra_judge_model,
+            judge_model=factory(settings.ra_judge_model),
         )
 
     runners = Runners(
@@ -196,6 +206,7 @@ def build_context() -> KernelContext:
         breakers=breakers,
         agents=agents,
         runners=runners,
+        model_factory=factory,
     )
 
 
@@ -368,7 +379,7 @@ def evals(
                 run_id=_new_run_id(),
             ),
             reports_dir=ctx.ra_dir / EVALS_DIRNAME,
-            judge_model=ctx.settings.ra_judge_model,
+            judge_model=ctx.model_factory(ctx.settings.ra_judge_model),
             repeat=repeat,
             include_expensive=everything,
         )
@@ -385,7 +396,7 @@ def status() -> None:
     """Show the runtime state."""
 
     def action() -> int:
-        ctx = build_context()
+        ctx = build_context(check_credentials=False)
         typer.echo(
             render_status(
                 ra_dir=ctx.ra_dir,
@@ -393,6 +404,7 @@ def status() -> None:
                 frontier_dir=ctx.root / EVALS_DIR.name / FRONTIER_DIRNAME,
                 budget_usd=ctx.settings.ra_budget_usd,
                 breakers=ctx.breakers,
+                settings=ctx.settings,
             )
         )
         return 0

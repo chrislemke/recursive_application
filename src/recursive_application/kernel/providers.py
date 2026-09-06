@@ -12,8 +12,16 @@ from pathlib import Path
 import httpx2
 from pydantic_ai.models import Model, infer_model
 
+from recursive_application.kernel.chatgpt import (
+    SIGN_IN_COMMAND,
+    SIGN_IN_FILENAME,
+    SignInError,
+    chatgpt_model,
+    load_sign_in,
+)
 from recursive_application.kernel.settings import (
     API_KEY_VARIABLE,
+    CODEX_HOME_VARIABLE,
     ENV_FILENAME,
     OPENAI_API_KEY_VARIABLE,
     Settings,
@@ -26,9 +34,6 @@ EXAMPLE_MODEL_NAME = "openrouter:anthropic/claude-sonnet-5"
 CHATGPT_SCHEME = "chatgpt"
 """The scheme paid for with the Operator's ChatGPT plan through the Codex Sign-in."""
 
-SIGN_IN_COMMAND = "codex login"
-"""The Operator's step that creates the Sign-in; the Kernel never signs in itself."""
-
 KEYED_SCHEMES: Mapping[str, str] = {
     "openrouter": API_KEY_VARIABLE,
     "openai": OPENAI_API_KEY_VARIABLE,
@@ -37,9 +42,6 @@ KEYED_SCHEMES: Mapping[str, str] = {
 }
 """The schemes paid for with a key, and the variable that holds it; the Settings field is the
 variable lower-cased. The only place a keyed scheme is spelled."""
-
-SIGN_IN_FILENAME = "auth.json"
-"""The file the Codex CLI writes under `CODEX_HOME` when the Operator signs in."""
 
 
 class ProviderError(SettingsError):
@@ -63,12 +65,23 @@ def sign_in_path(settings: Settings) -> Path:
     return settings.codex_home / SIGN_IN_FILENAME
 
 
-def require_credentials(settings: Settings) -> None:
+def _utc_now() -> datetime:
+    """The default clock: an aware UTC instant."""
+    return datetime.now(UTC)
+
+
+def instant_text(instant: datetime) -> str:
+    """An aware instant as ISO 8601 UTC with a `Z`, the form the Operator reads it in."""
+    return instant.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def require_credentials(settings: Settings, *, clock: Callable[[], datetime] = _utc_now) -> None:
     """Raise `ProviderError` naming what the Operator must set before anything runs.
 
     Each distinct model name among the two tiers is checked by its scheme: a keyed scheme needs
-    its variable non-blank; `chatgpt` needs the Sign-in file to exist. Any other scheme is left
-    to pydantic-ai, which raises its own error when the model is built.
+    its variable non-blank; `chatgpt` needs a Sign-in that loads and whose token outlives a run
+    of `ra_max_minutes` starting at `clock()`. Any other scheme is left to pydantic-ai, which
+    raises its own error when the model is built.
     """
     for name in dict.fromkeys((settings.ra_model, settings.ra_judge_model)):
         scheme = scheme_of(name)
@@ -77,16 +90,30 @@ def require_credentials(settings: Settings) -> None:
             raise ProviderError(
                 f"{variable} is not set for {name!r}; put it in {ENV_FILENAME} or the environment"
             )
-        if scheme == CHATGPT_SCHEME and not sign_in_path(settings).is_file():
-            raise ProviderError(
-                f"no ChatGPT sign-in at {sign_in_path(settings)} for {name!r}; "
-                f"run {SIGN_IN_COMMAND}"
-            )
+        if scheme == CHATGPT_SCHEME:
+            _require_sign_in(settings, name, clock())
 
 
-def _utc_now() -> datetime:
-    """The default clock: an aware UTC instant."""
-    return datetime.now(UTC)
+def _require_sign_in(settings: Settings, name: str, now: datetime) -> None:
+    """The `chatgpt` check: the Sign-in loads and its token outlives the run's wall time.
+
+    A Sign-in that does not load is refused with its own message plus the second remedy, a
+    `CODEX_HOME` naming the directory the Operator signed in under.
+    """
+    path = sign_in_path(settings)
+    try:
+        sign_in = load_sign_in(path)
+    except SignInError as error:
+        raise ProviderError(
+            f"for {name!r}: {error}, or point {CODEX_HOME_VARIABLE} at the directory "
+            "the Codex CLI signed in under"
+        ) from error
+    expires_at = sign_in.expires_at
+    if expires_at is not None and not sign_in.valid_for(now, settings.ra_max_minutes):
+        raise ProviderError(
+            f"the ChatGPT Sign-in at {path} for {name!r} expires at {instant_text(expires_at)}, "
+            f"before a run of {settings.ra_max_minutes} minutes would end; run {SIGN_IN_COMMAND}"
+        )
 
 
 def model_factory(
@@ -97,12 +124,22 @@ def model_factory(
 ) -> Callable[[str], Model]:
     """The adapter `AgentRunner` and the Judge Model setter receive: a model from its name.
 
-    Every name is built by pydantic-ai's `infer_model`, which reads the exported keys and makes
-    no network call. `clock` and `transport` are the subscription Provider's seams, part of the
-    signature so its callers never change.
+    A `chatgpt:` name is the subscription Provider over the Sign-in at `sign_in_path(settings)`,
+    read by `clock` and carried by `transport` (the network by default). Every other name is
+    built by pydantic-ai's `infer_model`, which reads the exported keys. Neither makes a network
+    call at build time.
     """
 
     def build(name: str) -> Model:
+        scheme, _, model_name = name.partition(":")
+        if scheme == CHATGPT_SCHEME:
+            return chatgpt_model(
+                model_name,
+                sign_in_path=sign_in_path(settings),
+                clock=clock,
+                transport=transport,
+                originator=settings.ra_chatgpt_originator,
+            )
         return infer_model(name)
 
     return build

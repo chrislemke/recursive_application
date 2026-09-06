@@ -3,7 +3,9 @@
 Every command builds its collaborators through `build_context()` and reaches its work through a
 module attribute of `kernel/cli.py`, so a test replaces both and never touches a model, git, or
 the real runtime directory. What is asserted here is what a caller sees: the arguments the
-command passed on, the text it printed, and the exit code it left behind.
+command passed on, the text it printed, and the exit code it left behind. The credential tests
+run the real `build_context` through `_isolate_build_context`, which points `.env` and `.ra` at
+`tmp_path` and only reads the checkout.
 """
 
 from collections.abc import Callable
@@ -14,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.models import Model
 from typer.testing import CliRunner
 
 from recursive_application.kernel import cli
@@ -22,7 +26,9 @@ from recursive_application.kernel.checks import run_checks, run_red_check
 from recursive_application.kernel.cli import KernelContext, app
 from recursive_application.kernel.evals import CaseResult, DatasetError, EvalReport
 from recursive_application.kernel.git import Repo
-from recursive_application.kernel.loop import LoopOptions, LoopResult, Runners
+from recursive_application.kernel.loop import EvalRequest, LoopOptions, LoopResult, Runners
+from recursive_application.kernel.paths import ensure_ra_dirs
+from recursive_application.kernel.providers import model_factory
 from recursive_application.kernel.records import (
     EvalCase,
     IterationRecord,
@@ -34,7 +40,7 @@ from recursive_application.kernel.records import (
 from recursive_application.kernel.registry import load_registry
 from recursive_application.kernel.runtime import AgentRunner
 from recursive_application.kernel.sensors import FEEDBACK_FILENAME, FeedbackStore
-from recursive_application.kernel.settings import Settings
+from recursive_application.kernel.settings import Settings, load_settings
 from recursive_application.organism.wiki import Wiki
 
 runner = CliRunner()
@@ -68,6 +74,7 @@ def _context(tmp_path: Path) -> KernelContext:
             clock=lambda: CLOCK_TIME,
             tracing=lambda run_id: ra_dir / f"{run_id}.jsonl",
         ),
+        model_factory=model_factory(settings),
     )
 
 
@@ -115,6 +122,16 @@ def _result(
 
 
 ANSWER = "A Protected Path is a file only the human may change."
+
+
+def _isolate_build_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Let the real `build_context` run without the real `.env` or the real runtime directory.
+
+    Settings come from the environment and an absent file under `tmp_path`; `.ra` is created
+    under `tmp_path`. The checkout itself is only read (the registry, the Wiki, the frontier).
+    """
+    monkeypatch.setattr(cli, "load_settings", lambda: load_settings(tmp_path / ".env"))
+    monkeypatch.setattr(cli, "ensure_ra_dirs", lambda root: ensure_ra_dirs(tmp_path))
 
 
 def test_help_exits_zero_and_lists_the_commands() -> None:
@@ -360,6 +377,7 @@ def test_evals_runs_the_named_dataset_and_prints_the_report_and_where_it_went(
         cases=[CaseResult(dataset="triage", name="a-clear-request", passed=True)],
     )
     saved = tmp_path / "reports" / "r1.json"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
     monkeypatch.setattr(cli, "run_evals", _fake_run_evals(calls, (report, saved)))
 
@@ -375,6 +393,7 @@ def test_the_full_suite_runs_every_dataset_including_the_expensive_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[_EvalsCall] = []
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
     monkeypatch.setattr(
         cli,
@@ -391,6 +410,7 @@ def test_the_full_suite_runs_every_dataset_including_the_expensive_ones(
 def test_an_unknown_dataset_is_a_usage_error_on_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
     monkeypatch.setattr(
         cli, "run_evals", _fake_run_evals([], DatasetError("unknown dataset: 'nope'"))
@@ -411,12 +431,18 @@ def test_status_prints_the_report_over_the_checkout_s_frontier_and_exits_zero(
     seen: list[Path] = []
 
     def fake_render_status(
-        *, ra_dir: Path, wiki: Any, frontier_dir: Path, budget_usd: Decimal, breakers: Any
+        *,
+        ra_dir: Path,
+        wiki: Any,
+        frontier_dir: Path,
+        budget_usd: Decimal,
+        breakers: Any,
+        settings: Settings,
     ) -> str:
         seen.append(frontier_dir)
         return STATUS_TEXT
 
-    monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
+    monkeypatch.setattr(cli, "build_context", lambda check_credentials: _context(tmp_path))
     monkeypatch.setattr(cli, "render_status", fake_render_status)
 
     result = runner.invoke(app, ["status"])
@@ -474,3 +500,100 @@ def test_a_document_that_is_not_there_is_a_usage_error_on_stderr(
 
     assert result.exit_code == 2
     assert "no such document" in result.stderr
+
+
+def test_ask_refuses_an_openai_primary_without_its_key_naming_the_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_build_context(monkeypatch, tmp_path)
+    monkeypatch.setenv("RA_MODEL", "openai:gpt-5.4")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(cli, "LoopRunner", _fake_loop([], _result("accepted", output=ANSWER)))
+
+    result = runner.invoke(app, ["ask", "hello", "--yes"])
+
+    assert result.exit_code == 2
+    assert "OPENAI_API_KEY" in result.stderr
+
+
+def test_ask_refuses_a_chatgpt_primary_without_a_sign_in_naming_codex_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_build_context(monkeypatch, tmp_path)
+    monkeypatch.setenv("RA_MODEL", "chatgpt:gpt-5.5")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(cli, "LoopRunner", _fake_loop([], _result("accepted", output=ANSWER)))
+
+    result = runner.invoke(app, ["ask", "hello", "--yes"])
+
+    assert result.exit_code == 2
+    assert "codex login" in result.stderr
+
+
+def test_status_runs_without_the_credentials_ask_would_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_build_context(monkeypatch, tmp_path)
+    monkeypatch.setenv("RA_MODEL", "chatgpt:gpt-5.5")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(cli, "render_status", lambda **collaborators: STATUS_TEXT)
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert STATUS_TEXT in result.output
+
+
+def test_evals_hands_run_evals_the_judge_model_built_from_its_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+
+    def fake_run_evals(names: Any, *, judge_model: Any, **options: Any) -> tuple[EvalReport, Path]:
+        seen.append(judge_model)
+        return EvalReport(datasets=[]), tmp_path / "r3.json"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
+    monkeypatch.setattr(cli, "run_evals", fake_run_evals)
+
+    result = runner.invoke(app, ["evals", "--dataset", "triage"])
+
+    assert result.exit_code == 0
+    assert isinstance(seen[0], Model)
+    assert seen[0].system == "openrouter"
+    assert seen[0].model_name == "openai/gpt-5.4-mini"
+
+
+def test_the_evals_runner_hands_evaluate_request_the_judge_model_built_from_its_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+
+    def fake_evaluate_request(request: Any, *, judge_model: Any, **options: Any) -> EvalReport:
+        seen.append(judge_model)
+        return EvalReport(run_id=request.run_id, datasets=[])
+
+    _isolate_build_context(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(cli, "evaluate_request", fake_evaluate_request)
+
+    cli.build_context().runners.evals(EvalRequest(run_id="r1"))
+
+    assert isinstance(seen[0], Model)
+    assert seen[0].system == "openrouter"
+    assert seen[0].model_name == "openai/gpt-5.4-mini"
+
+
+def test_a_model_name_pydantic_ai_refuses_is_a_usage_error_on_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "build_context", lambda: _context(tmp_path))
+    monkeypatch.setattr(cli, "LoopRunner", _fake_loop([], UserError("Unknown model: nope")))
+
+    result = runner.invoke(app, ["ask", "hello"])
+
+    assert result.exit_code == 2
+    assert "Unknown model: nope" in result.stderr

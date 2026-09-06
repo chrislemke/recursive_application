@@ -1,9 +1,10 @@
 """The status report and the Wiki commands.
 
 What the Operator sees and does between Loop runs, with no model call in `render_status`: the
-breakers, the open Sensor Findings, the recent runs, what they cost, how the eval suite moved,
-the frontier ladders, and the Librarian's proposals for the next rungs (ADR 0009). The three
-functions take their collaborators explicitly, so `kernel/cli.py` only wires them up.
+Providers and whether their credentials are there, the breakers, the open Sensor Findings, the
+recent runs, what they cost, how the eval suite moved, the frontier ladders, and the Librarian's
+proposals for the next rungs (ADR 0009). The three functions take their collaborators
+explicitly, so `kernel/cli.py` only wires them up.
 """
 
 from collections.abc import Sequence
@@ -18,16 +19,30 @@ from recursive_application.kernel.bundle import (
     frontier_line,
     run_line,
 )
+from recursive_application.kernel.chatgpt import (
+    SIGN_IN_COMMAND,
+    SignInError,
+    load_sign_in,
+    served_models,
+)
 from recursive_application.kernel.evals import (
     EvalReport,
     ReportStore,
     frontier_ratios,
 )
 from recursive_application.kernel.paths import EVALS_DIRNAME, RUNS_DIRNAME
+from recursive_application.kernel.providers import (
+    CHATGPT_SCHEME,
+    KEYED_SCHEMES,
+    instant_text,
+    scheme_of,
+    sign_in_path,
+)
 from recursive_application.kernel.records import Mode, RunStore
 from recursive_application.kernel.registry import Registry
 from recursive_application.kernel.runtime import AgentRunner
 from recursive_application.kernel.sensors import collect
+from recursive_application.kernel.settings import Settings
 from recursive_application.kernel.wiki_protocol import WikiMaintainer, WikiReader
 
 MAX_RUNS = 5
@@ -56,6 +71,51 @@ def _trend_lines(reports: Sequence[EvalReport]) -> list[str]:
     return lines
 
 
+def _provider_lines(settings: Settings) -> list[str]:
+    """The two tiers' model names, then whether each distinct credential in use is present.
+
+    A key is reported as `set` or `missing`, never by its value; the Settings field of a keyed
+    scheme is its variable lower-cased, as `KEYED_SCHEMES` says.
+    """
+    names = list(dict.fromkeys((settings.ra_model, settings.ra_judge_model)))
+    lines = [f"- primary: {settings.ra_model}", f"- judge: {settings.ra_judge_model}"]
+    credentials: list[str] = []
+    for name in names:
+        scheme = scheme_of(name)
+        variable = KEYED_SCHEMES.get(scheme)
+        if variable is not None:
+            present = bool(getattr(settings, variable.lower()))
+            credentials.append(f"- {variable}: {'set' if present else 'missing'}")
+        if scheme == CHATGPT_SCHEME:
+            credentials.extend(_sign_in_lines(settings))
+    return lines + list(dict.fromkeys(credentials))
+
+
+def _sign_in_lines(settings: Settings) -> list[str]:
+    """The ChatGPT Sign-in's state and the models the Codex cache says the backend serves.
+
+    A Sign-in that does not load is reported, not raised: this section is where the Operator
+    learns what to run next.
+    """
+    try:
+        sign_in = load_sign_in(sign_in_path(settings))
+    except SignInError:
+        return [f"- ChatGPT sign-in: not signed in (run {SIGN_IN_COMMAND})"]
+    expires_at = sign_in.expires_at
+    state = (
+        "valid, no expiry claim"
+        if expires_at is None
+        else f"valid until {instant_text(expires_at)}"
+    )
+    if sign_in.plan_type is not None:
+        state += f" (plan {sign_in.plan_type})"
+    lines = [f"- ChatGPT sign-in: {state}"]
+    models = served_models(settings.codex_home)
+    if models:
+        lines.append(f"- ChatGPT models: {', '.join(models)}")
+    return lines
+
+
 def render_status(
     *,
     ra_dir: Path,
@@ -63,8 +123,9 @@ def render_status(
     frontier_dir: Path,
     budget_usd: Decimal,
     breakers: BreakerStore,
+    settings: Settings,
 ) -> str:
-    """The status report: seven sections over the runtime directory, the Wiki, and the breakers.
+    """The status report: eight sections over Settings, the runtime directory, Wiki, and breakers.
 
     Every section is printed even when it is empty, so a fresh runtime directory reads the same
     way as a busy one and the Operator never wonders whether a section was dropped.
@@ -80,6 +141,7 @@ def render_status(
         if question.capability
     ]
     blocks = [
+        _block("## Providers", _provider_lines(settings)),
         _block(
             "## Breakers",
             [f"- {name}: {state}" for name, state in sorted(breakers.states().items())],
