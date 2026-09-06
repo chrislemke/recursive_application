@@ -840,6 +840,7 @@ name = "recursive-application"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx2" },
     { name = "logfire" },
     { name = "pydantic-ai-harness" },
     { name = "pydantic-ai-slim", extra = ["openrouter"] },
@@ -857,6 +858,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx2", specifier = ">=2.12,<3" },
     { name = "logfire", specifier = ">=5.0.0,<6" },
     { name = "pydantic-ai-harness", specifier = ">=0.29.0,<0.30" },
     { name = "pydantic-ai-slim", extras = ["openrouter"], specifier = ">=2.40.0,<3" },

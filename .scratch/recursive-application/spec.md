@@ -302,3 +302,27 @@ Prior art: the Phase 1 seams document defines the format (interface, dependencie
 - ty is pre-1.0 and its diagnostics may differ from pyright's. The Kernel must be brought to green under ty before the check is enabled in the Gate, so the bar is real from the first Growth Loop.
 - The issue tracker for this repo has not been configured yet (`/setup-matt-pocock-skills` has not been run). This spec is filed in the local-markdown convention. If GitHub Issues is chosen, this file's body becomes the issue and the `ready-for-agent` label applies.
 - Literature this shape follows: Anthropic's "Building effective agents" and long-running harness post, Self-Harness (2026), Weng's harness-engineering essay (2026), Kitchen Loop, SICA, and DGM, all summarised in the plan's references.
+
+## Amendment 2026-09-06: Providers (accepted 2026-09-06)
+
+Supersedes, in "Out of Scope", the words "Codex or other provider integrations beyond a model string" and "a custom Pydantic AI model class" to the extent below. Decisions: ADR 0011 (proposed) and `thoughts/shared/plans/2026-09-06-provider-seams.md`; facts: `thoughts/shared/research/2026-09-06-openai-provider-and-chatgpt-subscription-library-facts.md`. Vocabulary: Operator, Provider, Sign-in, added to `CONTEXT.md`.
+
+Stories
+
+80. As the Operator, I want a tier to run on my ChatGPT subscription, so that live Loops cost no API credit.
+81. As the Operator, I want to run a tier on the OpenAI API with my own key, so that a model OpenRouter does not carry is one variable away.
+82. As the Operator, I want `ra status` to name the Provider of each tier and whether its key or Sign-in is present, so that a run that cannot start is explained before it starts.
+83. As a Kernel maintainer, I want no token to appear in a trace, a Run Record, a message, a `repr`, or a tool's reach, so that the Organism cannot read or leak the Operator's Sign-in.
+
+Implementation decisions
+
+- The model name keeps pydantic-ai's syntax. Settings gain `OPENAI_API_KEY`, `CODEX_HOME` (default `~/.codex`), and `RA_CHATGPT_ORIGINATOR`. One new scheme, `chatgpt:<model>`, runs a tier on the ChatGPT subscription; every other scheme is pydantic-ai's own, so `openai:<model>` needs only the key. No new dependency: the OpenAI client ships with the OpenRouter extra.
+- One Kernel module builds the model for both tiers behind the agent runtime's `model_factory` seam and checks each tier's credentials by scheme before a command runs; `ra status` reports instead of refusing.
+- The Kernel never signs in and never writes the Sign-in. `codex login` is the Operator's step; the Kernel reads the Sign-in file before every request, refuses to start a run whose token expires before the run's wall-time budget ends, and never prints, logs, traces, or represents a token. Refreshing stays with Codex, whose refresh tokens rotate.
+- No custom Pydantic AI model class: the subscription adapter sits at the HTTP transport under pydantic-ai's OpenAI Responses model, injecting the headers the backend needs and turning the library's non-streaming request into the streaming one the backend requires.
+- Cost is reported at the OpenAI list price for subscription runs on model ids the price data knows, and 0 for the others; the token fallback binds there.
+- The Kernel does not retry a subscription 429: it means the plan's window is used up, and the breaker sees it at once.
+- The Policy Ceiling denies the Sign-in directory to every tool, next to `.env` and `.git`.
+- The Kernel identifies itself as itself in the request headers; identifying as the Codex CLI is an explicit Operator setting, never a default.
+
+Still out of scope: the Kernel performing an OAuth login or a token refresh; a Codex process as an Actor; reading the subscription's remaining quota into `ra status`; recording the Provider on the Run Record (open point). A Codex-driven refresh through `codex app-server` is the follow-up if runs die on token expiry.

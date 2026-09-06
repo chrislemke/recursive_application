@@ -30,6 +30,10 @@ _Avoid_: sandbox, permissions, allowlist
 The Kernel document that tells coding agents how code is written here.
 _Avoid_: style guide, handbook, CLAUDE.md
 
+**Operator**:
+The human who runs `ra`, approves Definitions of Done, holds the credentials, and owns the Kernel.
+_Avoid_: user, admin, human-in-the-loop
+
 ### Requests
 
 **Task**:
@@ -159,6 +163,16 @@ _Avoid_: performer, executor, assignee
 **Judge Model**:
 The second model, separate from the primary one, used by the Reviewer and by LLM-judge evaluators.
 _Avoid_: grader, evaluator model
+
+### Providers
+
+**Provider**:
+The Kernel adapter that turns a model name into a client that calls that model with the Operator's credentials. Three exist: OpenRouter, OpenAI, and ChatGPT.
+_Avoid_: vendor, gateway, backend, model host
+
+**Sign-in**:
+The Operator's ChatGPT login, made with the Codex CLI, whose tokens the Kernel reads and refreshes but never creates.
+_Avoid_: OAuth, login, session, credentials file
 
 ### Memory and evidence
 

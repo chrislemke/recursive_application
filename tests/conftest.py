@@ -20,13 +20,19 @@ from pydantic_ai import models
 
 models.ALLOW_MODEL_REQUESTS = False
 
-_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LOGFIRE_TOKEN")
+_SECRET_KEYS = (
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "LOGFIRE_TOKEN",
+    "CODEX_HOME",
+)
 _RA_PREFIX = "RA_"
 
 
 @pytest.fixture(autouse=True)
 def _clean_environment() -> Iterator[None]:
-    """Remove provider, Logfire, and `RA_*` variables, then restore the environment."""
+    """Remove provider, Logfire, Codex-home, and `RA_*` variables, then restore the environment."""
     saved = dict(os.environ)
     for key in list(os.environ):
         if key in _SECRET_KEYS or key.startswith(_RA_PREFIX):
