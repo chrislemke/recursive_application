@@ -171,7 +171,7 @@ The Kernel adapter that turns a model name into a client that calls that model w
 _Avoid_: vendor, gateway, backend, model host
 
 **Sign-in**:
-The Operator's ChatGPT login, made with the Codex CLI, whose tokens the Kernel reads and refreshes but never creates.
+The Operator's ChatGPT login, made with the Codex CLI, whose tokens the Kernel reads but never creates, refreshes, or writes.
 _Avoid_: OAuth, login, session, credentials file
 
 ### Memory and evidence

@@ -11,7 +11,7 @@ Source: the spec amendment of 2026-09-06 (Providers); ADR 0011; the seams docume
 **Owns:** `src/recursive_application/kernel/chatgpt.py` (new), `tests/kernel/test_chatgpt.py` (new). Nothing else.
 
 - [x] The seam is written in the seams-document format and confirmed by the user before the first red test
-- [ ] `httpx2>=2.12,<3` is in `pyproject.toml` and `uv.lock` before dispatch (orchestrator, human-approved dependency change)
+- [x] `httpx2>=2.12,<3` is in `pyproject.toml` and `uv.lock` before dispatch (orchestrator, human-approved dependency change)
 - [x] `load_sign_in` reads the Codex schema with `auth_mode` absent or a ChatGPT one, takes `account_id` from the id token when the field is null, refuses a missing file or an API-key Sign-in naming `codex login`, and its `repr` holds no token
 - [x] `expires_at` comes from the access token's `exp`; `valid_for` is false when the token expires inside the run's minutes and true for a token without `exp`
 - [x] `served_models` lists the slugs in `models_cache.json` and gives `[]` for a missing file
@@ -20,7 +20,7 @@ Source: the spec amendment of 2026-09-06 (Providers); ADR 0011; the seams docume
 - [x] An expired Sign-in answers a synthetic 401 naming `codex login` without a backend call
 - [x] A 401 and a `usage_limit_reached` 429 from the backend are pydantic-ai's `ModelHTTPError` with their status after exactly one HTTP call, no token in the text
 - [x] Nothing reaches the network: every transport is `httpx2.MockTransport`; `ALLOW_MODEL_REQUESTS` is patched only in the tests that drive the mock
-- [ ] All four checks exit 0
+- [x] All four checks exit 0
 
 ## Comments
 
@@ -43,3 +43,5 @@ Deviations and judgement calls for the human to confirm:
 - **No research fact proved wrong.** B6 was right about the unwrapped body; the inconsistency was in the seams document's bullet 7 literal.
 
 Also noted: `openai._streaming.SSEDecoder` is a private import, as the seams document's Internal section chose; ruff's selected rules do not flag it. Left for the orchestrator: the `httpx2` box, "All four checks exit 0" (they did on this machine, with ticket 26's files present: `ruff format`, `ruff check`, `ty check`, and the whole suite at 551 passed), and the git work.
+
+**2026-09-06, reviewed.** Two-axis review (standards, spec), applied. Both reviewers verified the two contested deviations against the installed source and agreed: pydantic-ai puts its own `User-Agent` into every request's `extra_headers` and the SDK merges per-request headers over client defaults, so the identity headers belong in the transport; the SDK unwraps the `error` key before pydantic-ai stores `ModelHTTPError.body`, so bullet 7 reads `body["type"]`. Both found the same defect: a parsable Sign-in file that is not a JSON object (`[]`, `null`), a non-object claim, a cache whose `models` is not a list, an `exp` outside the calendar, or a non-UTF-8 stream escaped the "never raises" guard as an `AttributeError`, `TypeError`, `OverflowError`, or `UnicodeDecodeError`, which the SDK reports as a connection error with the Operator's message lost. Fixed test-first with four new tests (21 in the file): the non-object file raises `SignInError` naming the path and `codex login`; the list-less cache gives `[]`; the out-of-range `exp` reads as no expiry; the garbled stream is a 502 `ModelHTTPError`. Also applied: `PACKAGE_NAME` and `PLACEHOLDER_API_KEY` are private (`SIGN_IN_COMMAND` stays public for ticket 28 to import); `except ValueError` alone, since `binascii.Error` subclasses it; the unused `EXPIRES_AT` and the recomputed `BACKEND_URL + "/responses"` assertion are gone; three docstrings say exactly what they do. The glossary's Sign-in entry now says the Kernel never refreshes or writes, matching ADR 0011 and the code. Kept: the private `openai._streaming.SSEDecoder` import the seams document chose (a six-line parser replaces it if the SDK renames it); the 502 body without event data (an in-stream `response.failed` reads as "ended without response.completed", one branch if ticket 29 needs the reason). Whole tree: four checks green, 555 tests.
