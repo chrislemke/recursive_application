@@ -1,6 +1,9 @@
 # Planner: the agent that turns Sensor Findings or a Task into one Plan for one Iteration.
 # Task function (ticket 15): `inputs` is a YAML mapping of task, goal, and findings (SensorFinding
 # fields); the output is the Plan rendered as YAML, so target_paths and dataset names are exact.
+# Applies to every case: the Kernel's custom evaluator, registered in kernel/evals.py.
+evaluators:
+  - OrganismTargetsOnly
 cases:
   - name: planner-1-frontier-text-analysis-adds-a-specialist
     inputs: |

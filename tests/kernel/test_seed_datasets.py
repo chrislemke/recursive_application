@@ -128,3 +128,11 @@ def test_each_case_name_is_unique_and_opens_with_its_role(role: str) -> None:
     assert len(set(names)) == len(names)
     for name in names:
         assert name is not None and name.startswith(f"{role}-")
+
+
+def test_the_custom_evaluators_guard_the_answers_and_the_planner_at_dataset_level() -> None:
+    answers = yaml.safe_load((EVALS_DIR / "answers.yaml").read_text(encoding="utf-8"))
+    planner = yaml.safe_load((EVALS_DIR / "planner.yaml").read_text(encoding="utf-8"))
+
+    assert answers["evaluators"] == ["NoSecrets"]
+    assert planner["evaluators"] == ["OrganismTargetsOnly"]
