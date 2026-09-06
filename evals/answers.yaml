@@ -1,5 +1,5 @@
 # Worker: the agent that produces a Task's output in Answer and Task Loop Modes and never edits
-# code. Task function (ticket 15): the question text goes to the Worker; the output is its
+# code. Task function: the question text goes to the Worker; the output is its
 # WorkerOutput.content, rendered as it is.
 # Applies to every case: the Kernel's custom evaluator, registered in kernel/evals.py.
 evaluators:

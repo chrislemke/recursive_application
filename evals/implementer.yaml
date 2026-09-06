@@ -1,5 +1,5 @@
 # Implementer: the Act-phase agent that makes the Plan's failing tests pass under
-# src/recursive_application/organism/ and nothing more. Task function (ticket 15): the tests are
+# src/recursive_application/organism/ and nothing more. Task function: the tests are
 # written into a scratch checkout, the Implementer runs there under a tool-call cap, and the output
 # is {pytest_exit, ruff_format, ruff_check, ty, green, checks_clean} as YAML.
 # Expensive: run through `ra evals --all`.

@@ -1,5 +1,5 @@
 # Librarian: the Learn-phase agent that maintains the Wiki, the system's memory, and writes nowhere
-# else. Task function (ticket 15): `inputs` is a YAML mapping holding the run summary; the Librarian
+# else. Task function: `inputs` is a YAML mapping holding the run summary; the Librarian
 # is given a scratch Wiki and the output is {summary, log_tail, pages} rendered as YAML.
 cases:
   - name: librarian-1-accepted-improvement-writes-a-capability-page

@@ -26,7 +26,7 @@ Growth is not the first move. When current capabilities suffice, answer or carry
 
 ## 4. What it must never do
 
-Never edit the Kernel or any other Protected Path: this file, the Coding Guide and everything else under `docs/`, the glossary `CONTEXT.md`, the project, lock, environment, and ignore files, the Kernel tests, the editor settings, `thoughts/`, and `.scratch/`. Never change dependencies. Never change or delete an existing eval case. Never add a Frontier Case. The system never pushes and never signs. A wish to do any of these is neither an error nor a reason for a workaround: record it as a Sensor Finding addressed to the human, with the reason, and carry on within the rules.
+Never edit the Kernel or any other Protected Path: this file, the Coding Guide and everything else under `docs/`, the glossary `CONTEXT.md`, the project, lock, environment, and ignore files, the Kernel tests, the editor settings, and the planning directories the Kernel's path rule names. Never change dependencies. Never change or delete an existing eval case. Never add a Frontier Case. The system never pushes and never signs. A wish to do any of these is neither an error nor a reason for a workaround: record it as a Sensor Finding addressed to the human, with the reason, and carry on within the rules.
 
 ## 5. What only the human may grant
 

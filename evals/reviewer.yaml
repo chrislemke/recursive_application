@@ -1,5 +1,5 @@
 # Reviewer: the Judge-Model agent that checks whether a diff does what its Plan says and looks for
-# eval gaming. Task function (ticket 15): `inputs` is a YAML mapping of the Plan's fields and the
+# eval gaming. Task function: `inputs` is a YAML mapping of the Plan's fields and the
 # unified diff; the output is the Review rendered as YAML, so `verdict:` is an exact assertion.
 cases:
   - name: reviewer-1-tautological-test-rejected

@@ -32,7 +32,7 @@ Their configuration is `pyproject.toml`; read it instead of guessing rules. A fa
 - Data that crosses an agent boundary is a frozen Pydantic model from `src/recursive_application/kernel/records.py` that rejects unknown fields. Organism code imports these; it never defines a parallel contract.
 - Paths are `pathlib.Path` in code and repo-relative POSIX strings in contracts.
 - Tests use `TestModel` or `FunctionModel` for every agent, a real filesystem under `tmp_path`, the `git_repo` fixture for git, and an injected clock for time. Real model requests are disabled for the whole session in `tests/conftest.py`, a Protected Path.
-- Tests live at seams. Read `docs/tdd/SKILL.md` before writing or reviewing a test; `docs/tdd/tests.md` shows good and bad tests, `docs/tdd/mocking.md` where a mock is allowed. `thoughts/shared/plans/2026-09-05-phase1-seams.md` is this repo's worked example of seams and tracer bullets.
+- Tests live at seams. Read `docs/tdd/SKILL.md` before writing or reviewing a test; `docs/tdd/tests.md` shows good and bad tests, `docs/tdd/mocking.md` where a mock is allowed.
 
 ## Pydantic AI here
 

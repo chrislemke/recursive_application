@@ -1,5 +1,5 @@
 # Triage: the agent that performs the Reflection and assigns a Mode to every Task.
-# Task function (ticket 15): the request text goes to Triage; the output is its TriageDecision
+# Task function: the request text goes to Triage; the output is its TriageDecision
 # rendered as YAML, so `mode:` and the gap's `kind:` are exact assertions.
 cases:
   - name: triage-1-answer-from-current-capabilities

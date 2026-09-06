@@ -16,3 +16,10 @@ dist/
 
 # OS
 .DS_Store
+
+# Development workflow: tickets, plans, research, and Claude Code configuration stay local
+.scratch/
+thoughts/
+.claude/
+CLAUDE.md
+docs/agents/

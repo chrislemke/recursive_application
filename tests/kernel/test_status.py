@@ -389,7 +389,7 @@ def test_linting_names_an_unlinked_page_under_both_headings_and_exits_one(tmp_pa
 def test_a_document_under_the_checkout_is_logged_by_its_repo_relative_path(tmp_path: Path) -> None:
     wiki = _wiki(tmp_path)
 
-    _ingest(REPO_ROOT / "docs" / "agents" / "triage-labels.md", tmp_path, wiki)
+    _ingest(REPO_ROOT / "docs" / "coding-guide.md", tmp_path, wiki)
 
     last_line = (wiki.root / "log.md").read_text().splitlines()[-1]
-    assert last_line.endswith("Ingested docs/agents/triage-labels.md")
+    assert last_line.endswith("Ingested docs/coding-guide.md")

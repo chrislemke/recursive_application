@@ -1,5 +1,5 @@
 # Test Writer: the Act-phase agent that turns a Plan's `tests` sentences into failing pytest tests
-# under tests/organism/. Task function (ticket 15): the Organism is copied into a scratch checkout,
+# under tests/organism/. Task function: the Organism is copied into a scratch checkout,
 # the Test Writer runs there, pytest runs on the files it changed, and the output is
 # {changed_files, pytest_exit, red} as YAML. Expensive: run through `ra evals --all`.
 cases:
